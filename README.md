@@ -129,6 +129,7 @@ Entry rules:
 
 - IPv4: dotted literal or CIDR, optional `:port` suffix (`10.22.86.0/24:8080`)
 - IPv6: unbracketed literal or CIDR (`2001:db8::1`, `2001:db8::/32` — same syntax as `deniedResolvedAddresses`); bracketed literals (`[2001:db8::1]`) remain accepted
+- A `:port` suffix on an **IPv6** range is written bracketed, like a bracketed literal: `[2001:db8::/32]:8080` (the unbracketed `2001:db8::/32:8080` is an address ambiguity and is rejected)
 - A CIDR entry matches IP-literal destinations only, never names. A *name* in `allowedDomains` (e.g. `*.corp`) may still resolve into an allowed network — the runtime's resolved-address check judges the final address (loopback, link-local, multicast, cloud-metadata and your own interface addresses stay denied unless explicitly allowed by an IP entry).
 
 Two client-side caveats for **raw IP destinations** on private ranges (RFC1918, link-local):

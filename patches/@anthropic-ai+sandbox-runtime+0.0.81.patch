@@ -1,8 +1,8 @@
 diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/domain-pattern.d.ts b/patched/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/domain-pattern.d.ts
-index 5dbdbbc..6b2382a 100644
+index 5dbdbbc..73e4d70 100644
 --- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/domain-pattern.d.ts
 +++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/domain-pattern.d.ts
-@@ -46,19 +46,28 @@ export declare const DOMAIN_PATTERN_MESSAGE = "Invalid domain pattern. Must be a
+@@ -46,19 +46,31 @@ export declare const DOMAIN_PATTERN_MESSAGE = "Invalid domain pattern. Must be a
   * mean, rather than accept an entry that can silently match the wrong thing.
   */
  export declare function hasValidIpv6Bracketing(val: string): boolean;
@@ -24,7 +24,10 @@ index 5dbdbbc..6b2382a 100644
 + * `192.168.1.10`, `2001:db8::/32` — IPv6 unbracketed, the same syntax as
 + * `deniedResolvedAddresses`) is judged as an address rule rather than a
 + * domain pattern. The `:port` suffix is split off first, so
-+ * `10.0.0.0/8:8080` validates like any other `host:port` entry.
++ * `10.0.0.0/8:8080` validates like any other `host:port` entry; an IPv6
++ * range takes the port bracketed, `[2001:db8::/32]:8080`, because
++ * unbracketed `2001:db8::/32:8080` is indistinguishable from an address
++ * (the same reason a port-scoped `2001:db8::1:443` is unrepresentable).
 + */
 +export declare function isAddressRangeEntry(val: string): boolean;
 +/**
@@ -36,7 +39,7 @@ index 5dbdbbc..6b2382a 100644
      range: string;
      port?: number;
  }>;
-@@ -69,10 +78,12 @@ export declare function stripDomainPatternPort(pattern: string): string;
+@@ -69,10 +81,14 @@ export declare function stripDomainPatternPort(pattern: string): string;
   *
   * Patterns:
   *   - `*` matches everything (deny-all; the schema only accepts this in
@@ -44,13 +47,15 @@ index 5dbdbbc..6b2382a 100644
   *   - `*.example.com` matches any strict subdomain of example.com.
 + *   - an IP literal or CIDR range (`10.0.0.0/8`, `2001:db8::/32`) matches
 + *     IP-literal destinations only, by range membership — never names.
++ *     Callers that judge IP spellings (filterNetworkRequest canonicalizes
++ *     the destination first) get the same treatment as for exact literals.
   *   - anything else matches exactly (case-insensitive).
   *
   * Wildcard suffix matching is refused for IP literals so an IPv6 zone-ID
   * payload like `::ffff:1.2.3.4%x.allowed.com` cannot pass `.endsWith()`
   * while the OS connects to the bare IP. isValidHost already rejects `%`,
 diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/domain-pattern.js b/patched/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/domain-pattern.js
-index bbbb3a4..d198228 100644
+index bbbb3a4..6a50a5c 100644
 --- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/domain-pattern.js
 +++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/domain-pattern.js
 @@ -5,12 +5,13 @@
@@ -94,7 +99,7 @@ index bbbb3a4..d198228 100644
   * protocols, paths, ports, and overly broad wildcards.
   */
  export function isValidDomainPattern(val) {
-@@ -125,28 +141,45 @@ export function hasValidIpv6Bracketing(val) {
+@@ -125,28 +141,48 @@ export function hasValidIpv6Bracketing(val) {
      const multiColon = first !== -1 && val.indexOf(':', first + 1) !== -1;
      return !multiColon || val.startsWith('[');
  }
@@ -116,7 +121,7 @@ index bbbb3a4..d198228 100644
  export const ALLOWED_DOMAIN_ENTRY_MESSAGE = DOMAIN_PATTERN_MESSAGE +
 -    ' An optional ":port" suffix (1-65535) restricts the entry to that port.';
 +    ' An IP literal or CIDR range (IPv4 or IPv6, unbracketed; e.g., "10.0.0.0/8", "192.168.1.10", "2001:db8::/32") is also accepted. ' +
-+    'An optional ":port" suffix (1-65535) restricts the entry to that port.';
++    'An optional ":port" suffix (1-65535) restricts the entry to that port; an IPv6 range takes it bracketed ("[2001:db8::/32]:8080").';
  /**
 - * The IP-literal entries of an allow/deny list as `{ range, port? }` rules
 - * for the resolved-address check: an address the list names explicitly is
@@ -125,7 +130,10 @@ index bbbb3a4..d198228 100644
 + * `192.168.1.10`, `2001:db8::/32` — IPv6 unbracketed, the same syntax as
 + * `deniedResolvedAddresses`) is judged as an address rule rather than a
 + * domain pattern. The `:port` suffix is split off first, so
-+ * `10.0.0.0/8:8080` validates like any other `host:port` entry.
++ * `10.0.0.0/8:8080` validates like any other `host:port` entry; an IPv6
++ * range takes the port bracketed, `[2001:db8::/32]:8080`, because
++ * unbracketed `2001:db8::/32:8080` is indistinguishable from an address
++ * (the same reason a port-scoped `2001:db8::1:443` is unrepresentable).
 + */
 +export function isAddressRangeEntry(val) {
 +    return (parseAddressRange(splitDomainPatternPort(val).hostPattern) !== undefined);
@@ -149,7 +157,7 @@ index bbbb3a4..d198228 100644
  /** Drop a `:port` suffix, if any (see {@link splitDomainPatternPort}). */
  export function stripDomainPatternPort(pattern) {
      return splitDomainPatternPort(pattern).hostPattern;
-@@ -156,10 +189,12 @@ export function stripDomainPatternPort(pattern) {
+@@ -156,10 +192,14 @@ export function stripDomainPatternPort(pattern) {
   *
   * Patterns:
   *   - `*` matches everything (deny-all; the schema only accepts this in
@@ -157,12 +165,14 @@ index bbbb3a4..d198228 100644
   *   - `*.example.com` matches any strict subdomain of example.com.
 + *   - an IP literal or CIDR range (`10.0.0.0/8`, `2001:db8::/32`) matches
 + *     IP-literal destinations only, by range membership — never names.
++ *     Callers that judge IP spellings (filterNetworkRequest canonicalizes
++ *     the destination first) get the same treatment as for exact literals.
   *   - anything else matches exactly (case-insensitive).
   *
   * Wildcard suffix matching is refused for IP literals so an IPv6 zone-ID
   * payload like `::ffff:1.2.3.4%x.allowed.com` cannot pass `.endsWith()`
   * while the OS connects to the bare IP. isValidHost already rejects `%`,
-@@ -167,10 +202,18 @@ export function stripDomainPatternPort(pattern) {
+@@ -167,10 +207,27 @@ export function stripDomainPatternPort(pattern) {
   */
  export function matchesDomainPattern(hostname, pattern) {
      const h = hostname.toLowerCase();
@@ -173,7 +183,16 @@ index bbbb3a4..d198228 100644
 +        if (!list)
 +            return false;
 +        const bare = stripBrackets(h);
-+        const addr = isIP(bare) ? bare : (canonicalizeHost(bare) ?? bare);
++        // A range entry matches IP-literal destinations only, never names.
++        // Only IP spellings are canonicalized and range-checked: a strict IP
++        // (isIP), or a pure numeric IPv4 form (decimal "169236173" or dotted
++        // "127.1") that canonicalizeHost resolves to an IP. A name — which
++        // carries an alphabetic label — is refused here rather than
++        // canonicalized into a range; it is judged by where it actually
++        // resolves, via the resolved-address check.
++        if (isIP(bare) === 0 && !/^\d+(\.\d+)*$/.test(bare))
++            return false;
++        const addr = canonicalizeHost(bare) ?? bare;
 +        return isIP(addr) !== 0 && addressInSet(list, addr);
 +    }
      if (pattern.startsWith('*.')) {
@@ -182,7 +201,7 @@ index bbbb3a4..d198228 100644
          const baseDomain = pattern.substring(2).toLowerCase();
          return h.endsWith('.' + baseDomain);
 diff --git a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-config.js b/patched/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-config.js
-index 76b00b1..3391a7a 100644
+index 76b00b1..42628ea 100644
 --- a/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-config.js
 +++ b/node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-config.js
 @@ -6,11 +6,11 @@ import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path';
@@ -214,28 +233,31 @@ index 76b00b1..3391a7a 100644
      message: DOMAIN_PATTERN_MESSAGE +
 -        ' In deniedDomains a bare "*" (deny-all) is also accepted, and an optional ":port" suffix (1-65535) restricts the entry to that port.',
 +        ' In deniedDomains a bare "*" (deny-all) is also accepted, as is an IP literal or CIDR range (IPv4 or IPv6, unbracketed; e.g., "10.0.0.0/8", "2001:db8::/32"). ' +
-+        'An optional ":port" suffix (1-65535) restricts the entry to that port.',
++        'An optional ":port" suffix (1-65535) restricts the entry to that port; an IPv6 range takes it bracketed ("[2001:db8::/32]:8080").',
  });
  /** IP literal or CIDR range (`10.0.0.0/8`, `fc00::/7`, `169.254.169.254`). */
  const addressRangeSchema = z
      .string()
      .refine(v => parseAddressRange(v) !== undefined, {
-@@ -583,14 +586,18 @@ export const CredentialsConfigSchema = z
+@@ -583,15 +586,19 @@ export const CredentialsConfigSchema = z
   */
  export const NetworkConfigSchema = z.object({
      allowedDomains: z
          .array(domainPortPatternSchema)
          .describe('List of allowed domains (e.g., ["github.com", "*.npmjs.org", "api.example.com:443"]). ' +
+-        'An optional ":port" suffix restricts the entry to that destination port.'),
 +        'An IP literal or CIDR range (IPv4 or IPv6, unbracketed; e.g., "10.0.0.0/8", "2001:db8::/32") is also accepted and ' +
-+        'matches IP-literal destinations by range. ' +
-         'An optional ":port" suffix restricts the entry to that destination port.'),
++        'matches IP-literal destinations by range, never names. ' +
++        'An optional ":port" suffix restricts the entry to that destination port; an IPv6 range takes it bracketed ("[2001:db8::/32]:8080").'),
      deniedDomains: z
          .array(deniedDomainPatternSchema)
          .describe('List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all). ' +
+-        'An optional ":port" suffix (e.g., "*:22") restricts the entry to that destination port.'),
 +        'An IP literal or CIDR range (IPv4 or IPv6, unbracketed; e.g., "10.0.0.0/8", "2001:db8::/32") is also accepted ' +
 +        'and denies IP-literal destinations by range, as well as any hostname resolving into it. ' +
-         'An optional ":port" suffix (e.g., "*:22") restricts the entry to that destination port.'),
++        'An optional ":port" suffix (e.g., "*:22") restricts the entry to that destination port; an IPv6 range takes it bracketed ("[2001:db8::/32]:8080").'),
      deniedDomainReasons: z
          .record(z.string(), z.string().min(1))
          .optional()
          .describe('Optional model-facing reason keyed by the exact deniedDomains entry it explains (e.g., {"github.com:22": "SSH pushes to GitHub are blocked; use an https remote"}). ' +
+         'Reported in the <sandbox_violations> line when that entry denies a connection, and to the sandboxed client as the status phrase of the 403 that answers its CONNECT; entries without one use a generic reason. ' +

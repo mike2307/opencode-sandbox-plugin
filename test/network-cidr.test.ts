@@ -30,6 +30,7 @@ describe("patched SRT schema accepts CIDR entries", () => {
     expect(networkOk(["2001:db8::/32"])).toBe(true)
     expect(networkOk(["2001:db8::1"])).toBe(true)
     expect(networkOk(["[2001:db8::1]"])).toBe(true)
+    expect(networkOk(["[2001:db8::/32]:8080"])).toBe(true)
     expect(networkOk(["github.com", "10.22.86.0/24"])).toBe(true)
   })
 
@@ -43,6 +44,7 @@ describe("patched SRT schema accepts CIDR entries", () => {
     expect(networkOk(["10.0.0.0/33"])).toBe(false)
     expect(networkOk(["2001:db8::/129"])).toBe(false)
     expect(networkOk(["[2001:db8::]/32"])).toBe(false)
+    expect(networkOk(["2001:db8::/32:8080"])).toBe(false)
     expect(networkOk(["10.22.86.0/24junk"])).toBe(false)
     expect(networkOk(["*.10.0.0.0/8"])).toBe(false)
     expect(networkOk(["10.22.86.0/24:0"])).toBe(false)
@@ -56,15 +58,21 @@ describe("patched SRT matcher is CIDR-aware", () => {
     expect(matchesDomainPatternWithPort("10.22.86.5", 443, "10.22.86.0/24:8080")).toBe(false)
     expect(matchesDomainPatternWithPort("10.22.86.5", 8080, "10.22.86.0/24:8080")).toBe(true)
     expect(matchesDomainPatternWithPort("10.22.87.1", 443, "10.22.86.0/24")).toBe(false)
-    // inet_aton shorthand (169236173 == 10.22.86.5) canonicalizes into the range
+    // inet_aton shorthand (169236173 == 10.22.86.205) canonicalizes into the range
     expect(matchesDomainPatternWithPort("169236173", 443, "10.22.86.0/24")).toBe(true)
     expect(matchesDomainPattern("2001:db8::1", "2001:db8::/32")).toBe(true)
     expect(matchesDomainPattern("2001:db9::1", "2001:db8::/32")).toBe(false)
+    // port-scoped IPv6 range, bracketed
+    expect(matchesDomainPatternWithPort("2001:db8::5", 8080, "[2001:db8::/32]:8080")).toBe(true)
+    expect(matchesDomainPatternWithPort("2001:db8::5", 443, "[2001:db8::/32]:8080")).toBe(false)
   })
 
   test("never matches names or the wrong direction", () => {
     expect(matchesDomainPattern("evil.com", "10.0.0.0/8")).toBe(false)
     expect(matchesDomainPattern("10.22.86.5", "evil.com")).toBe(false)
+    // names never match ranges — not even ones carrying a decimal address
+    expect(matchesDomainPattern("169236173x", "10.22.86.0/24")).toBe(false)
+    expect(matchesDomainPattern("10.22.86.5.example.com", "10.22.86.0/24")).toBe(false)
     // existing behavior is untouched
     expect(matchesDomainPatternWithPort("api.github.com", 443, "*.github.com")).toBe(true)
     expect(matchesDomainPattern("127.0.0.1", "127.0.0.1")).toBe(true)
@@ -122,5 +130,23 @@ describe("patched resolved-address guard honors CIDR lists", () => {
       resolve: fakeResolve(["127.0.0.1"]),
     })
     expect(carved.permits("svc.internal", "127.0.0.1", 443)).toBe(true)
+  })
+
+  test("a name that spells an allowed range is judged by where it resolves", () => {
+    // "169236173" spells 10.22.86.205 (in the allowed 10.22.86.0/24) —
+    // its spelling earns no carve-out for an address it resolves to
+    // outside the range
+    const guard = createResolvedAddressGuard({
+      allowedDomains: ["10.22.86.0/24"],
+      deniedDomains: [],
+      resolve: fakeResolve(["127.0.0.2"]),
+    })
+    expect(guard.permits("169236173", "127.0.0.2", 443)).toBe(false)
+    const inRange = createResolvedAddressGuard({
+      allowedDomains: ["10.22.86.0/24"],
+      deniedDomains: [],
+      resolve: fakeResolve(["10.22.86.205"]),
+    })
+    expect(inRange.permits("169236173", "10.22.86.205", 443)).toBe(true)
   })
 })
