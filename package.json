@@ -15,20 +15,22 @@
   },
   "files": [
     "dist",
+    "patches",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "bun build ./src/index.ts ./src/tui.tsx --outdir dist --target node --format esm --external @anthropic-ai/sandbox-runtime --external @opencode/plugin --external '@opencode/plugin/*' --external @opentui/core --external '@opentui/*' --external solid-js && bun x tsc --emitDeclarationOnly --declaration --outDir dist",
-    "test": "bun test",
-    "test:coverage": "bun test --coverage",
+    "test": "sh -c 'for f in test/*.test.ts; do bun test \"$f\" || exit 1; done'",
+    "test:coverage": "sh -c 'for f in test/*.test.ts; do bun test --coverage \"$f\" || exit 1; done'",
     "lint": "biome lint .",
     "format": "biome format .",
     "format:fix": "biome format --write .",
     "typecheck": "tsc --noEmit",
     "check": "biome check .",
     "check:fix": "biome check --write .",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build",
+    "postinstall": "patch-package || echo '[opencode-sandbox] could not apply the local sandbox-runtime patch (patch-package unavailable) — CIDR network entries will be rejected by the runtime; see README \"Local patch\"'"
   },
   "keywords": [
     "opencode",
@@ -56,7 +58,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.76"
+    "@anthropic-ai/sandbox-runtime": "0.0.81"
   },
   "peerDependencies": {
     "@opencode/plugin": ">=2.0.0"
@@ -73,6 +75,7 @@
     "@opentui/core": "^0.5.14",
     "@opentui/solid": "^0.5.14",
     "@types/bun": "^1.3.9",
+    "patch-package": "^8.0.0",
     "solid-js": "^1.9.15",
     "typescript": "^7.0.2"
   }

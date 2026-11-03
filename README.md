@@ -112,6 +112,32 @@ $ curl https://registry.npmjs.org
 (works — npmjs.org is in the default allowlist)
 ```
 
+### IP addresses and network ranges (CIDR)
+
+`allowedDomains` and `deniedDomains` also accept IP literals and CIDR ranges, in addition to domains and `*.domain` wildcards:
+
+```json
+{
+  "network": {
+    "allowedDomains": ["10.22.86.0/24", "10.22.86.5", "2001:db8::/32", "[2001:db8::1]"],
+    "deniedDomains": ["192.168.1.0/24"]
+  }
+}
+```
+
+Entry rules:
+
+- IPv4: dotted literal or CIDR, optional `:port` suffix (`10.22.86.0/24:8080`)
+- IPv6: unbracketed literal or CIDR (`2001:db8::1`, `2001:db8::/32` — same syntax as `deniedResolvedAddresses`); bracketed literals (`[2001:db8::1]`) remain accepted
+- A CIDR entry matches IP-literal destinations only, never names. A *name* in `allowedDomains` (e.g. `*.corp`) may still resolve into an allowed network — the runtime's resolved-address check judges the final address (loopback, link-local, multicast, cloud-metadata and your own interface addresses stay denied unless explicitly allowed by an IP entry).
+
+Two client-side caveats for **raw IP destinations** on private ranges (RFC1918, link-local):
+
+- The sandbox forces `HTTP(S)_PROXY` into every sandboxed process and lists the RFC1918 blocks in `NO_PROXY`, so proxy-respecting clients (curl, git, …) try to dial the address *directly* and fail — the sandboxed network namespace has no route. Route such traffic through the sandbox proxy explicitly: a SOCKS5 client (SOCKS ignores `NO_PROXY`), or e.g. `curl --proxy "$HTTP_PROXY" --noproxy '' …`.
+- Hostname destinations are unaffected: they are not in `NO_PROXY`, go through the proxy, and pass the allowlist by name.
+
+CIDR support in the allow/deny lists is provided by a [local patch](#local-patch-against-anthropic-ai-sandbox-runtime) against `@anthropic-ai/sandbox-runtime`; the upstream feature request is [anthropics/sandbox-runtime#65](https://github.com/anthropics/sandbox-runtime/issues/65).
+
 ### Default restrictions
 
 **Filesystem (deny-read)**:
@@ -197,7 +223,7 @@ If `XDG_CONFIG_HOME` is set, it is used instead of `~/.config`.
 Path precedence is inherited from `@anthropic-ai/sandbox-runtime`:
 
 - Read: `allowRead` takes precedence over `denyRead`
-- Write: `denyWrite` takes precedence over `allowWrite`
+- Write: `denyWrite` takes precedence over `allowWrite`, at any nesting depth (an `allowWrite` path inside a `denyWrite` directory stays denied)
 
 ### Example: allow git commit signing with SSH public key
 
@@ -303,9 +329,38 @@ Sandbox initialization is deferred until the first command, so the plugin does n
 
 `@anthropic-ai/sandbox-runtime` supports Windows through an argv-and-environment API that OpenCode's plugin interfaces do not expose. Until they can be connected safely, the plugin blocks Windows commands.
 
+### Nested sandboxing (SRT ≥ 0.0.80)
+
+Since SRT 0.0.80, a sandboxed command stays in the namespaces it was given: it can no longer create its own user or mount namespace. Tools that sandbox themselves that way — rootless `podman`/`buildah`, Chromium/Electron, a nested `bubblewrap`, `unshare -r` — stop working inside the sandbox. SRT can lift this with `allowNestedUserNamespaces: true`, but that is a runtime-level option this plugin does not (and will not) forward, so such workflows have to run with the sandbox [paused](#toggle) for the project.
+
 ### Failure behavior
 
 If sandbox initialization or wrapping fails, the affected command is blocked.
+
+### Local patch against @anthropic-ai/sandbox-runtime
+
+The runtime's config schema only accepts domains, `*.domain` wildcards and IP literals in `network.allowedDomains` / `network.deniedDomains` — no CIDR ranges (upstream RFE: [anthropics/sandbox-runtime#65](https://github.com/anthropics/sandbox-runtime/issues/65)). This plugin therefore ships a local patch, `patches/@anthropic-ai+sandbox-runtime+0.0.81.patch`, that adds IP-literal/CIDR entries to both lists:
+
+- config-time validation accepts the entries (same syntax as `deniedResolvedAddresses`),
+- destination matching judges them by range membership (`net.BlockList`),
+- the resolved-address guard receives them, so deny-CIDRs also block hostnames that resolve into the range.
+
+Mechanics:
+
+- `@anthropic-ai/sandbox-runtime` is **pinned to the exact version the patch was generated against** (`0.0.81`). A `postinstall` script runs `patch-package`, which applies the patch after every `bun install`; if it cannot (version bump, patch missing), it reports the failure instead of aborting the install, and the guardrail test below makes the gap visible.
+- `test/network-cidr.test.ts` is a guardrail: it imports the installed dist files directly, so a missing patch (or a future SRT version without the feature) turns the suite red instead of letting CIDR entries be rejected at sandbox start.
+
+Regenerating the patch for a newer SRT version: install the new version, apply the equivalent changes to `node_modules/@anthropic-ai/sandbox-runtime/dist/sandbox/{domain-pattern.js,domain-pattern.d.ts,sandbox-config.js}` (or port the patch with `filterdiff`/`git apply --3way`), then regenerate the file against a pristine tarball:
+
+```sh
+git diff --no-index pristine/node_modules patched/node_modules > patches/@anthropic-ai+sandbox-runtime+<version>.patch
+```
+
+…bump the dependency pin, and update the guardrail test's expected behavior if the upstream semantics changed. If the feature ships upstream, delete the patch, the pin (go back to a `^` range) and the `postinstall` hook — the guardrail test should then pass against the unpatched runtime.
+
+### Test isolation note
+
+`bun test` runs test files in one process by default, and `mock.module()` is process-global and never reset between files (oven-sh/bun#31316) — `test/plugin.test.ts` mocks `../src/probe`, which would break `test/probe.test.ts`'s imports in the same process. The `test` script therefore runs each test file in its own `bun test` invocation.
 
 ## Related
 
