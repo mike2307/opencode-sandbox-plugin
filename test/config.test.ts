@@ -167,6 +167,35 @@ describe("resolveConfig", () => {
     expect(config.network?.allowUnixSockets).toEqual(["/var/run/docker.sock"])
     expect(config.network?.allowAllUnixSockets).toBe(false)
   })
+
+  test("disables the network proxy when network.disabled is true", () => {
+    const user: SandboxPluginConfig = {
+      network: {
+        disabled: true,
+      },
+    }
+    const config = resolveConfig(PROJECT_DIR, WORKTREE, user)
+
+    // No allow list → the runtime sets needsNetworkProxy to false (no proxy).
+    expect(config.network?.allowedDomains).toBeUndefined()
+    expect(config.network?.deniedDomains).toEqual([])
+
+    // Filesystem restrictions are untouched.
+    expect(config.filesystem?.allowWrite).toContain(PROJECT_DIR)
+    expect(config.filesystem?.denyRead).toContain(path.join(os.homedir(), ".ssh"))
+  })
+
+  test("network.disabled takes precedence over allowedDomains in the same block", () => {
+    const user: SandboxPluginConfig = {
+      network: {
+        disabled: true,
+        allowedDomains: ["github.com"],
+      },
+    }
+    const config = resolveConfig(PROJECT_DIR, WORKTREE, user)
+
+    expect(config.network?.allowedDomains).toBeUndefined()
+  })
 })
 
 describe("loadConfig", () => {
@@ -437,6 +466,19 @@ describe("validateConfig", () => {
     })
     expect(errors).toEqual([])
     expect(warnings).toEqual([])
+  })
+
+  test("accepts network.disabled as a boolean", () => {
+    const { errors, warnings } = validateConfig({
+      network: { disabled: true },
+    })
+    expect(errors).toEqual([])
+    expect(warnings).toEqual([])
+  })
+
+  test("rejects a non-boolean network.disabled", () => {
+    const { errors } = validateConfig({ network: { disabled: "yes" } })
+    expect(errors).toContain("network.disabled must be a boolean")
   })
 
   test("collects every structural error", () => {

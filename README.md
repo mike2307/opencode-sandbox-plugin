@@ -112,6 +112,20 @@ $ curl https://registry.npmjs.org
 (works — npmjs.org is in the default allowlist)
 ```
 
+### Disable the network sandbox
+
+Set `network.disabled: true` to run commands with **unrestricted network access** while keeping all filesystem (read/write) restrictions in place. The local allow-list proxy is not started at all — no `HTTP(S)_PROXY`/`NO_PROXY` is injected and no isolated network namespace is created, so commands reach the host network directly:
+
+```json
+{
+  "network": {
+    "disabled": true
+  }
+}
+```
+
+`disabled` takes precedence over `allowedDomains`/`deniedDomains` in the same block (they are ignored). Filesystem sandboxing is unaffected; the whole-sandbox switches (top-level `disabled: true`, `OPENCODE_DISABLE_SANDBOX=1`, and "Toggle Sandbox") still disable *everything*, network included.
+
 ### IP addresses and network ranges (CIDR)
 
 `allowedDomains` and `deniedDomains` also accept IP literals and CIDR ranges, in addition to domains and `*.domain` wildcards:
@@ -296,6 +310,8 @@ Or in any config file:
   "disabled": true
 }
 ```
+
+These switches turn off the *entire* sandbox (network and filesystem). To keep filesystem restrictions but drop only the network layer, see [Disable the network sandbox](#disable-the-network-sandbox).
 
 ### Toggle
 
