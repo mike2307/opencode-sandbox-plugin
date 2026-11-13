@@ -10,9 +10,12 @@ import {
   fenceCapabilityFix,
   fenceCommand,
   fenceDependenciesMissing,
+  PASTA_FENCE_OPTIONS,
   parseFenceAllowlist,
+  parseFenceDenylist,
   parseFenceEntry,
   type Resolve4,
+  runsWithNoNewPrivs,
   sweepFenceDirs,
 } from "../src/fence"
 import { GUEST_SH, MOUNT_RUNNER_SH, NAMESPACE_SETUP_SH } from "../src/fence-assets"
@@ -207,14 +210,9 @@ describe("buildFenceCommand", () => {
       { resolve4: fakeResolve4, warn: () => {} },
     )
     try {
-      expect(command.startsWith("pasta --config-net --runas")).toBe(true)
-      expect(command).toContain(
-        `pasta --config-net --runas '${os.userInfo().username}' /usr/bin/bash '${path.join(dir, "guest.sh")}'`,
+      expect(command).toBe(
+        `pasta ${PASTA_FENCE_OPTIONS.join(" ")} --runas '${os.userInfo().username}' /usr/bin/bash '${path.join(dir, "guest.sh")}'`,
       )
-      expect(command).toContain("2>'")
-      expect(command.split("\n").pop()).toBe("exit $_rc")
-      expect(command).toContain("--config-net")
-      expect(command).toContain("pasta")
 
       const files = await fsPromises.readdir(dir)
       for (const name of [
@@ -237,6 +235,9 @@ describe("buildFenceCommand", () => {
 
       // The IP backstop: policy drop, dns endpoint, pinned IPs, CIDRs.
       const rules = await fsPromises.readFile(path.join(dir, "nft.rules"), "utf8")
+      // inet: the policy drop covers IPv6 as well.
+      expect(rules).toContain("add table inet egress")
+      expect(rules).not.toContain("table ip ")
       expect(rules).toContain("policy drop")
       expect(rules).toContain("oifname lo accept")
       expect(rules).toContain("ip daddr 10.9.9.2 udp dport 53 accept")
@@ -308,6 +309,30 @@ describe("buildFenceCommand", () => {
       await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
     }
   })
+  test("honors the denylist: denied names are not pinned, denied IPs dropped first", async () => {
+    const warnings: string[] = []
+    const { dir } = await buildFenceCommand(
+      "/usr/bin/bwrap -- true",
+      ["registry.npmjs.org", "pypi.org", "10.0.0.0/8"],
+      {
+        denylist: ["PyPI.org", "*.npmjs.org", "10.1.2.3", "::1"],
+        resolve4: fakeResolve4,
+        warn: (m) => warnings.push(m),
+      },
+    )
+    try {
+      expect(await fsPromises.readFile(path.join(dir, "pin.txt"), "utf8")).toBe("")
+      const rules = (await fsPromises.readFile(path.join(dir, "nft.rules"), "utf8")).split("\n")
+      const drop = rules.indexOf("add rule inet egress output ip daddr 10.1.2.3 drop")
+      const accept = rules.indexOf("add rule inet egress output ip daddr 10.0.0.0/8 accept")
+      expect(drop).toBeGreaterThan(-1)
+      expect(accept).toBeGreaterThan(drop)
+      expect(warnings).toEqual([expect.stringContaining("ignoring denylist entry ::1")])
+    } finally {
+      await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
   test("applies the guest-root capability fix to the wrapped.sh body", async () => {
     const wrapped =
       "bwrap --new-session --die-with-parent --ro-bind / / --dev /dev --unshare-pid --unshare-user --cap-drop ALL --proc /proc --unsetenv SRT_ALLOW_NESTED_USERNS -- /bin/bash -c 'SRT_ALLOW_NESTED_USERNS=0 /x/apply-seccomp /bin/bash -c echo'"
@@ -329,34 +354,29 @@ describe("buildFenceCommand", () => {
 describe("fenceCommand", () => {
   test("single-quotes the guest path and username", () => {
     expect(fenceCommand("/tmp/opencode-fence-abc")).toBe(
-      [
-        `pasta --config-net --runas '${os.userInfo().username}' /usr/bin/bash '/tmp/opencode-fence-abc/guest.sh' 2>'/tmp/opencode-fence-pasta-abc.err'`,
-        "_rc=$?",
-        `grep -v -e 'No interfaces with usable IPv6 routes' -e 'IPv6: no external interface as template, use local mode' <'/tmp/opencode-fence-pasta-abc.err' >&2 2>/dev/null`,
-        `rm -f '/tmp/opencode-fence-pasta-abc.err'`,
-        "exit $_rc",
-      ].join("\n"),
+      `pasta ${PASTA_FENCE_OPTIONS.join(" ")} --runas '${os.userInfo().username}' /usr/bin/bash '/tmp/opencode-fence-abc/guest.sh'`,
     )
     // The splice idiom: close the quote, an escaped literal quote, reopen.
     // ('o''connor' would parse as the bare word oconnor — wrong.)
     expect(fenceCommand("/tmp/x", "o'connor")).toContain(
-      "pasta --config-net --runas 'o'\\''connor' /usr/bin/bash '/tmp/x/guest.sh'",
+      "--runas 'o'\\''connor' /usr/bin/bash '/tmp/x/guest.sh'",
     )
   })
 
-  test("routes pasta stderr through a per-dir file, filters the chatter, restores the exit status", () => {
-    const lines = fenceCommand("/tmp/opencode-fence-abc").split("\n")
-    expect(lines).toHaveLength(5)
-    // stderr goes to a file NEXT TO the fence dir, named after it — so the
-    // startup sweep reaps it if the command is killed before the rm.
-    expect(lines[0]).toContain("2>'/tmp/opencode-fence-pasta-abc.err'")
-    expect(lines[1]).toBe("_rc=$?")
-    expect(lines[2]).toContain("grep -v")
-    expect(lines[2]).toContain("No interfaces with usable IPv6 routes")
-    expect(lines[2]).toContain("IPv6: no external interface as template, use local mode")
-    expect(lines[2]).toContain(">&2")
-    expect(lines[3]).toBe("rm -f '/tmp/opencode-fence-pasta-abc.err'")
-    expect(lines[4]).toBe("exit $_rc")
+  test("closes pasta's default holes and leaves stderr alone", () => {
+    const command = fenceCommand("/tmp/opencode-fence-abc")
+    // No host-loopback forwarding (-T/-U auto) and no inbound forwarding.
+    for (const flag of ["-T none", "-U none", "-t none", "-u none"]) expect(command).toContain(flag)
+    expect(command).toContain("--no-map-gw")
+    expect(command).toContain("--ipv4-only")
+    // The fence brings its own resolver; pasta must not look for the host's
+    // (a loopback resolver is unreachable with --no-map-gw: warning per command).
+    expect(command).toContain("--dns none")
+    // Info chatter is suppressed by pasta itself; a redirect would also
+    // capture the command's own stderr (the guest inherits pasta's stdio).
+    expect(command).toContain("--quiet")
+    expect(command).not.toContain("2>")
+    expect(command.split("\n")).toHaveLength(1)
   })
 })
 
@@ -364,15 +384,83 @@ describe("fenceDependenciesMissing", () => {
   test("reports the tools absent from PATH", async () => {
     const bin = `${TEST_TMP}/bin`
     await fsPromises.mkdir(bin, { recursive: true })
-    for (const name of FENCE_DEPENDENCIES) {
+    for (const name of [...FENCE_DEPENDENCIES, "python3"]) {
       const p = path.join(bin, name)
       await fsPromises.writeFile(p, "#!/bin/sh\nexit 0\n")
       fs.chmodSync(p, 0o755)
     }
-    expect(fenceDependenciesMissing(`${bin}:/usr/bin`)).toEqual([])
+    const interpreter = path.join(bin, "python3")
+    expect(fenceDependenciesMissing(bin, [interpreter])).toEqual([])
     await fsPromises.rm(path.join(bin, "nft"))
-    expect(fenceDependenciesMissing(`${bin}:/nonexistent-path-only`)).toEqual(["nft"])
+    expect(fenceDependenciesMissing(bin, [interpreter])).toEqual(["nft"])
+    // Absolute interpreters are checked by path, not looked up in PATH.
+    await fsPromises.rm(interpreter)
+    expect(fenceDependenciesMissing(bin, [interpreter])).toEqual(["nft", interpreter])
     await fsPromises.rm(bin, { recursive: true, force: true })
+  })
+})
+
+describe("parseFenceDenylist", () => {
+  test("splits names, wildcard suffixes, networks, and skips", () => {
+    const denied = parseFenceDenylist(["Evil.com", "*.corp.local", "10.1.0.0/16", "x.com:22"])
+    expect([...denied.names]).toEqual(["evil.com"])
+    expect(denied.suffixes).toEqual([".corp.local"])
+    expect(denied.networks).toEqual(["10.1.0.0/16"])
+    expect(denied.skips.map((s) => s.entry)).toEqual(["x.com:22"])
+  })
+})
+
+describe("runsWithNoNewPrivs", () => {
+  test("reads the NoNewPrivs flag from a status file", async () => {
+    const status = path.join(TEST_TMP, "status")
+    await fsPromises.writeFile(status, "Name:\tx\nNoNewPrivs:\t1\nSeccomp:\t2\n")
+    expect(runsWithNoNewPrivs(status)).toBe(true)
+    await fsPromises.writeFile(status, "Name:\tx\nNoNewPrivs:\t0\n")
+    expect(runsWithNoNewPrivs(status)).toBe(false)
+    expect(runsWithNoNewPrivs(path.join(TEST_TMP, "missing"))).toBe(false)
+  })
+})
+
+describe("egress-responder", () => {
+  test("answers pinned names and NXDOMAINs everything else", async () => {
+    if (!fs.existsSync("/usr/bin/python3")) return
+    const pin = path.join(TEST_TMP, "pin-responder.txt")
+    await fsPromises.writeFile(pin, "example.com 93.184.215.14\n")
+    const port = 20000 + (process.pid % 20000)
+    const script = path.join(import.meta.dirname, "..", "src", "fence", "egress-responder.py")
+    const child = Bun.spawn(["/usr/bin/python3", script, String(port), pin, "127.0.0.1"], {
+      stderr: "pipe",
+    })
+    try {
+      // Wait for the readiness line the guest also waits for.
+      const reader = child.stderr.getReader()
+      const { value } = await reader.read()
+      expect(new TextDecoder().decode(value)).toStartWith("responder listening")
+      const query = (name: string, qtype: number) => {
+        const labels = name.split(".").flatMap((l) => [l.length, ...Buffer.from(l)])
+        return Buffer.from([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, ...labels, 0, 0, qtype, 0, 1])
+      }
+      const ask = async (name: string, qtype: number) => {
+        const { promise, resolve } = Promise.withResolvers<Buffer>()
+        const socket = await Bun.udpSocket({
+          socket: { data: (_s, data) => resolve(Buffer.from(data)) },
+        })
+        socket.send(query(name, qtype), port, "127.0.0.1")
+        const reply = await promise
+        socket.close()
+        return { rcode: reply[3] & 0xf, answers: reply.readUInt16BE(6), tail: reply.subarray(-4) }
+      }
+      const allowed = await ask("example.com", 1)
+      expect(allowed.rcode).toBe(0)
+      expect(allowed.answers).toBe(1)
+      expect([...allowed.tail]).toEqual([93, 184, 215, 14])
+      // Not allowlisted: NXDOMAIN, no sinkhole address (0.0.0.0 is local).
+      const blocked = await ask("evil.org", 1)
+      expect(blocked.rcode).toBe(3)
+      expect(blocked.answers).toBe(0)
+    } finally {
+      child.kill()
+    }
   })
 })
 
@@ -417,6 +505,12 @@ describe("fence-assets invariants", () => {
   test("the veth wiring is consistent across the scripts", () => {
     expect(GUEST_SH).toContain("ip link add dns0 type veth peer name dns1")
     expect(GUEST_SH).toContain("ip addr add 10.9.9.1/30 dev dns0")
+    // Readiness is awaited, not slept for; a failed veth move is fatal, and
+    // the move waits for the child's own netns (else it is a silent no-op).
+    expect(GUEST_SH).toContain('grep -q "^responder listening"')
+    expect(GUEST_SH).not.toContain("sleep 1.5")
+    expect(GUEST_SH).toContain('fail "moving the dns veth peer')
+    expect(GUEST_SH).toContain('[ "$CHILD_NS" != "$SELF_NS" ]')
     expect(NAMESPACE_SETUP_SH).toContain('ip addr add "$DNS_IP"/30 dev "$IF"')
     expect(MOUNT_RUNNER_SH).toContain('mount --bind "$DIR/resolv.conf"')
     expect(MOUNT_RUNNER_SH).toContain('exec /bin/sh "$DIR/wrapped.sh"')

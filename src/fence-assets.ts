@@ -4,9 +4,12 @@
 //
 // Model (proxy-less, unprivileged, no host CAPs):
 //
-//   pasta --config-net            owns the network namespace (guest is uid 0 in
-//   + /usr/bin/bash guest.sh      the pasta user namespace => local
-//                                 CAP_NET_ADMIN, free :53 bind, veth, nft).
+//   pasta --config-net -4         owns the network namespace (guest is uid 0 in
+//   (no port forwarding,          the pasta user namespace => local
+//    no gateway->host mapping)    CAP_NET_ADMIN, free :53 bind, veth, nft).
+//   + /usr/bin/bash guest.sh      pasta runs it as PID 1 of a fresh PID
+//                                 namespace: when it exits or is killed, the
+//                                 kernel kills the responder with it.
 //     + setup.sh  (unshare --net) pinning DNS responder in its OWN netns at
 //                                 10.9.9.2, reached over a veth from the guest
 //                                 (pasta bridges a wildcard 0.0.0.0:53 into the
@@ -60,14 +63,33 @@ ip link set dns0 up || fail "bringing up the dns veth pair"
 # 2. pinning responder in its OWN fresh netns (clean :53), in the background.
 unshare --net /usr/bin/bash "$DIR/setup.sh" "$DIR/egress-responder.py" "$DIR/pin.txt" >"$DIR/resp.log" 2>&1 &
 RESP_PID=$!
-# Move the veth peer into the responder netns. Retry: the child may still be
-# entering its new netns when we first try.
-for i in $(seq 1 30); do
-  ip link set dns1 netns "$RESP_PID" 2>/dev/null && break
-  sleep 0.1
+# Move the veth peer into the responder netns. Wait until the child has
+# actually entered its new netns first: before that, its /proc ns link still
+# equals ours and "moving" dns1 there is a silent no-op that strands it here.
+SELF_NS="$(readlink /proc/self/ns/net)"
+MOVED=""
+for i in $(seq 1 250); do
+  CHILD_NS="$(readlink "/proc/$RESP_PID/ns/net" 2>/dev/null)"
+  if [ -n "$CHILD_NS" ] && [ "$CHILD_NS" != "$SELF_NS" ] &&
+    ip link set dns1 netns "$RESP_PID" 2>/dev/null; then
+    MOVED=1
+    break
+  fi
+  kill -0 "$RESP_PID" 2>/dev/null || break
+  sleep 0.02
 done
-sleep 1.5
-if ! kill -0 "$RESP_PID" 2>/dev/null; then
+[ -n "$MOVED" ] || fail "moving the dns veth peer into the responder netns"
+# Wait for the responder's readiness line instead of a fixed delay.
+READY=""
+for i in $(seq 1 250); do
+  if grep -q "^responder listening" "$DIR/resp.log" 2>/dev/null; then
+    READY=1
+    break
+  fi
+  kill -0 "$RESP_PID" 2>/dev/null || break
+  sleep 0.02
+done
+if [ -z "$READY" ]; then
   echo "opencode-sandbox fence: the dns responder did not come up:" >&2
   cat "$DIR/resp.log" >&2
   fail "dns responder failed"
@@ -99,9 +121,9 @@ PIN="$2"
 DNS_IP=10.9.9.2
 IF=dns1
 # Wait for the veth peer to be moved into this netns.
-for i in $(seq 1 100); do
+for i in $(seq 1 250); do
   ip -o link show "$IF" >/dev/null 2>&1 && break
-  sleep 0.1
+  sleep 0.02
 done
 if ! ip -o link show "$IF" >/dev/null 2>&1; then
   echo "fence: $IF never appeared in this netns" >&2

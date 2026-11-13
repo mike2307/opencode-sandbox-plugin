@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process"
 import dns from "node:dns/promises"
 import fs from "node:fs"
 import fsPromises from "node:fs/promises"
@@ -107,10 +108,27 @@ export async function parseFenceAllowlist(
   const pins: FencePin[] = []
   const networks: string[] = []
   const skips: FenceSkip[] = []
-  const seenPins = new Set<string>()
   const seenNetworks = new Set<string>()
-  for (const raw of entries) {
-    const entry = parseFenceEntry(raw)
+  const parsedEntries = entries.map(parseFenceEntry)
+  // Resolve every distinct domain concurrently: one slow name must not add
+  // its latency to every other lookup.
+  const domains = [...new Set(parsedEntries.flatMap((e) => (e.kind === "domain" ? [e.name] : [])))]
+  const resolved = new Map(
+    await Promise.all(
+      domains.map(
+        async (name) =>
+          [
+            name,
+            await resolve4(name).then(
+              (ips) => ({ ips }),
+              (err: unknown) => ({ error: err instanceof Error ? err.message : String(err) }),
+            ),
+          ] as const,
+      ),
+    ),
+  )
+  const seenPins = new Set<string>()
+  for (const entry of parsedEntries) {
     if (entry.kind === "skip") {
       skips.push({ entry: entry.entry, reason: entry.reason })
       continue
@@ -123,25 +141,59 @@ export async function parseFenceAllowlist(
       continue
     }
     if (seenPins.has(entry.name)) continue
-    let ips: string[]
-    try {
-      ips = await resolve4(entry.name)
-    } catch (err) {
-      skips.push({
-        entry: entry.name,
-        reason: `resolution failed: ${err instanceof Error ? err.message : String(err)}`,
-      })
+    seenPins.add(entry.name)
+    const result = resolved.get(entry.name)
+    if (!result || "error" in result) {
+      skips.push({ entry: entry.name, reason: `resolution failed: ${result?.error}` })
       continue
     }
-    const v4 = [...new Set(ips.filter((ip) => ipv4Valid(ip)))].sort()
+    const v4 = [...new Set(result.ips.filter((ip) => ipv4Valid(ip)))].sort()
     if (v4.length === 0) {
       skips.push({ entry: entry.name, reason: "resolved no IPv4 addresses" })
       continue
     }
-    seenPins.add(entry.name)
     pins.push({ name: entry.name, ips: v4 })
   }
   return { pins, networks, skips }
+}
+
+export type FenceDenied = {
+  /** exact domains, lowercased: never pinned. */
+  names: Set<string>
+  /** `*.domain` suffixes (".domain"): no subdomain of these is pinned. */
+  suffixes: string[]
+  /** IPv4 literals and CIDRs: dropped ahead of every accept rule. */
+  networks: string[]
+  /** entries the v1 fence cannot express. */
+  skips: FenceSkip[]
+}
+
+/**
+ * Classify deniedDomains for the fence. Denials only ever narrow the
+ * allowlist: a denied name is never pinned (so it gets NXDOMAIN), a denied
+ * IPv4/CIDR is dropped by nft even inside an allowed CIDR.
+ */
+export function parseFenceDenylist(entries: string[]): FenceDenied {
+  const denied: FenceDenied = { names: new Set(), suffixes: [], networks: [], skips: [] }
+  for (const raw of entries) {
+    const entry = raw.trim()
+    const wildcard = entry.match(/^\*\.(.+)$/)
+    if (wildcard && DOMAIN_RE.test(wildcard[1])) {
+      denied.suffixes.push(`.${wildcard[1].toLowerCase()}`)
+      continue
+    }
+    const parsed = parseFenceEntry(entry)
+    if (parsed.kind === "domain") denied.names.add(parsed.name)
+    else if (parsed.kind === "network") denied.networks.push(parsed.value)
+    else denied.skips.push({ entry: parsed.entry, reason: parsed.reason })
+  }
+  return denied
+}
+
+/** Whether an allowlist entry names a denied domain (exact or by wildcard). */
+function isDeniedName(entry: string, denied: FenceDenied): boolean {
+  const name = entry.trim().toLowerCase()
+  return denied.names.has(name) || denied.suffixes.some((suffix) => name.endsWith(suffix))
 }
 
 function ipv4Valid(ip: string): boolean {
@@ -162,6 +214,8 @@ export type FenceCommand = {
 }
 
 export type BuildFenceOptions = {
+  /** deniedDomains: removed from the allowlist (names) or dropped ahead of it (IPv4/CIDR). */
+  denylist?: string[]
   /** Resolver standing in for dns.resolve4 (tests). */
   resolve4?: Resolve4
   /** Sink for skip warnings (defaults to console.warn). */
@@ -179,7 +233,13 @@ export async function buildFenceCommand(
   options: BuildFenceOptions = {},
 ): Promise<FenceCommand> {
   const warn = options.warn ?? ((message: string) => console.warn(message))
-  const parsed = await parseFenceAllowlist(allowlist, options.resolve4)
+  const denied = parseFenceDenylist(options.denylist ?? [])
+  for (const skip of denied.skips)
+    warn(`[opencode-sandbox] fence: ignoring denylist entry ${skip.entry} — ${skip.reason}`)
+  const parsed = await parseFenceAllowlist(
+    allowlist.filter((entry) => !isDeniedName(entry, denied)),
+    options.resolve4,
+  )
   for (const skip of parsed.skips)
     warn(`[opencode-sandbox] fence: ignoring allowlist entry ${skip.entry} — ${skip.reason}`)
 
@@ -197,10 +257,10 @@ export async function buildFenceCommand(
       fsPromises.writeFile(path.join(dir, "resolv.conf"), RESOLV_CONF),
       fsPromises.writeFile(path.join(dir, "nsswitch.conf"), NSSWITCH_CONF),
       fsPromises.writeFile(path.join(dir, "pin.txt"), pinLines(parsed.pins)),
-      fsPromises.writeFile(path.join(dir, "nft.rules"), nftRules(parsed)),
+      fsPromises.writeFile(path.join(dir, "nft.rules"), nftRules(parsed, denied.networks)),
       // The wrapped command is already a fully quoted command line
-      // (the runtime quotes every word); as the body of a sh script it is
-      // parsed into exactly the argv bwrap expects.
+      // (the runtime quotes every word with POSIX single quotes); as the body
+      // of a sh script it is parsed into exactly the argv bwrap expects.
       fsPromises.writeFile(path.join(dir, "wrapped.sh"), `#!/bin/sh\nexec ${wrappedInGuest}\n`),
     ])
   } catch (err) {
@@ -246,27 +306,50 @@ export function fenceCommand(dir: string, username: string = os.userInfo().usern
   // make pasta execvp() it, whose PATH search hits ~/.local/bin — a `search`
   // the pasta_t SELinux domain is denied.
   //
-  // pasta's own stderr (its IPv6 info lines on hosts without usable IPv6,
-  // and any real setup error) would otherwise leak into the command's stderr
-  // verbatim. Route it through a per-command file named after the fence dir
-  // (sweepFenceDirs reaps it if this command is killed before the rm below),
-  // filter the known chatter, replay the rest, restore pasta's exit status.
-  const tag = path.basename(dir).slice(FENCE_DIR_PREFIX.length)
-  const errFile = path.join(path.dirname(dir), `${FENCE_DIR_PREFIX}pasta-${tag}.err`)
-  const noise = PASTA_NOISE_LINES.map((line) => `-e ${shQuote(line)}`).join(" ")
+  // The guest inherits pasta's stdio, so stderr must NOT be redirected here
+  // (it would swallow the command's own stderr); --quiet drops pasta's info
+  // chatter instead.
   return [
-    `pasta --config-net --runas ${shQuote(username)} /usr/bin/bash ${shQuote(path.join(dir, "guest.sh"))} 2>${shQuote(errFile)}`,
-    "_rc=$?",
-    `grep -v ${noise} <${shQuote(errFile)} >&2 2>/dev/null`,
-    `rm -f ${shQuote(errFile)}`,
-    "exit $_rc",
-  ].join("\n")
+    "pasta",
+    ...PASTA_FENCE_OPTIONS,
+    "--runas",
+    shQuote(username),
+    "/usr/bin/bash",
+    shQuote(path.join(dir, "guest.sh")),
+  ].join(" ")
 }
 
-/** pasta's harmless setup chatter, filtered out of the command's stderr. */
-const PASTA_NOISE_LINES = [
-  "No interfaces with usable IPv6 routes",
-  "IPv6: no external interface as template, use local mode",
+/**
+ * pasta options of the fence. pasta's defaults would open holes around the
+ * egress allowlist:
+ *   -T/-U auto   forward namespace-loopback connections to ports bound on the
+ *                HOST's loopback (every local service reachable via 127.0.0.1)
+ *   -t/-u auto   expose ports bound inside the namespace on the host
+ *   gateway map  the gateway address reaches the host's loopback
+ *   IPv6         the allowlist is IPv4-only; no v6 in the namespace at all
+ *                (the ruleset drops v6 as well)
+ *   DNS          pasta's own resolver plumbing is unused (the fence brings
+ *                its own); without --dns none it warns on every command when
+ *                the host resolver is on loopback (systemd-resolved), which
+ *                --no-map-gw makes unreachable — a warning --quiet keeps
+ */
+export const PASTA_FENCE_OPTIONS = [
+  "--quiet",
+  "--config-net",
+  "--ipv4-only",
+  "--no-map-gw",
+  "--dns",
+  "none",
+  "--search",
+  "none",
+  "-t",
+  "none",
+  "-u",
+  "none",
+  "-T",
+  "none",
+  "-U",
+  "none",
 ]
 
 function pinLines(pins: FencePin[]): string {
@@ -274,31 +357,33 @@ function pinLines(pins: FencePin[]): string {
   return `${pins.map((pin) => `${pin.name} ${pin.ips.join(" ")}`).join("\n")}\n`
 }
 
-function nftRules(parsed: FenceParsed): string {
+function nftRules(parsed: FenceParsed, deniedNetworks: string[] = []): string {
+  // inet: one policy-drop chain for BOTH families, so IPv6 egress is dropped
+  // (only loopback passes) even if pasta ever configured v6.
   const lines = [
     "flush ruleset",
-    "add table ip egress",
-    "add chain ip egress output { type filter hook output priority 0; policy drop; }",
-    "add rule ip egress output oifname lo accept",
-    `add rule ip egress output ip daddr ${DNS_ADDR} udp dport 53 accept`,
-    "add rule ip egress output ct state established,related accept",
+    "add table inet egress",
+    "add chain inet egress output { type filter hook output priority 0; policy drop; }",
+    "add rule inet egress output oifname lo accept",
+    `add rule inet egress output ip daddr ${DNS_ADDR} udp dport 53 accept`,
+    "add rule inet egress output ct state established,related accept",
   ]
+  for (const network of deniedNetworks)
+    lines.push(`add rule inet egress output ip daddr ${network} drop`)
   for (const pin of parsed.pins)
-    for (const ip of pin.ips) lines.push(`add rule ip egress output ip daddr ${ip} accept`)
+    for (const ip of pin.ips) lines.push(`add rule inet egress output ip daddr ${ip} accept`)
   for (const network of parsed.networks)
-    lines.push(`add rule ip egress output ip daddr ${network} accept`)
+    lines.push(`add rule inet egress output ip daddr ${network} accept`)
   return `${lines.join("\n")}\n`
 }
 
 const shQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
 
 /**
- * Fence scratch dirs (and the per-command pasta-stderr files, named
- * opencode-fence-* as well) left behind by a killed command (the guest
- * removes its own dir on every exit path it reaches; the stderr file is
- * removed by the fence command itself). Remove opencode-fence-* entries
- * under tmpdir whose mtime is older than maxAgeMs. Returns how many were
- * removed.
+ * Fence scratch dirs left behind by a killed command (the guest removes its
+ * own dir on every exit path it reaches; older plugin versions also left
+ * opencode-fence-pasta-*.err files). Remove opencode-fence-* entries under
+ * tmpdir whose mtime is older than maxAgeMs. Returns how many were removed.
  */
 export async function sweepFenceDirs(
   tmpdir: string = os.tmpdir(),
@@ -327,15 +412,107 @@ export async function sweepFenceDirs(
   return removed
 }
 
-/** Tools the fence needs on the host, in the order the guest uses them. */
-export const FENCE_DEPENDENCIES = ["pasta", "python3", "ip", "nft", "unshare"]
+/** Tools the fence needs from PATH, in the order the guest uses them. */
+export const FENCE_DEPENDENCIES = ["pasta", "ip", "unshare", "nft", "mount", "readlink"]
 
-/** Names of FENCE_DEPENDENCIES missing from PATH (empty when all are present). */
-export function fenceDependenciesMissing(envPath: string = process.env.PATH ?? ""): string[] {
+/** Interpreters the fence scripts invoke by absolute path (not via PATH). */
+export const FENCE_ABSOLUTE_DEPENDENCIES = ["/usr/bin/bash", "/usr/bin/python3", "/bin/sh"]
+
+/**
+ * Fence dependencies that are missing (empty when all are present): PATH
+ * tools by name, the absolute interpreters by path.
+ */
+export function fenceDependenciesMissing(
+  envPath: string = process.env.PATH ?? "",
+  absolute: string[] = FENCE_ABSOLUTE_DEPENDENCIES,
+): string[] {
   const dirs = envPath.split(":").filter(Boolean)
-  return FENCE_DEPENDENCIES.filter(
-    (name) => !dirs.some((dir) => executableAt(path.join(dir, name))),
+  return [
+    ...FENCE_DEPENDENCIES.filter((name) => !dirs.some((dir) => executableAt(path.join(dir, name)))),
+    ...absolute.filter((p) => !executableAt(p)),
+  ]
+}
+
+/**
+ * Whether this process runs with no_new_privs. pasta is normally entered
+ * into its own SELinux domain (pasta_t); under no_new_privs that transition
+ * is denied (AVC `nnp_transition nosuid_transition`), and pasta runs
+ * unconfined in the caller's domain instead — functional, but it raises an
+ * SELinux alert per command. Typical cause: opencode itself started from
+ * within a sandbox (bwrap / seccomp helper / systemd NoNewPrivileges=).
+ */
+export function runsWithNoNewPrivs(statusFile = "/proc/self/status"): boolean {
+  try {
+    return /^NoNewPrivs:\s*1\s*$/m.test(fs.readFileSync(statusFile, "utf8"))
+  } catch {
+    return false
+  }
+}
+
+// Probe workload, run INSIDE the fence with an empty allowlist: egress to a
+// public address must fail (101 otherwise) and a lookup must be refused by
+// the name gate (102 otherwise).
+const FENCE_PROBE_PY = [
+  "import socket, sys",
+  "s = socket.socket()",
+  "s.settimeout(1.5)",
+  "try:",
+  '    s.connect(("1.1.1.1", 443))',
+  "    sys.exit(101)",
+  "except OSError:",
+  "    pass",
+  "try:",
+  '    socket.getaddrinfo("example.com", 443)',
+  "    sys.exit(102)",
+  "except OSError:",
+  "    pass",
+].join("\n")
+
+const FENCE_PROBE_TIMEOUT_MS = 20_000
+
+/**
+ * Verify the fence end to end before trusting it with agent commands: pasta
+ * starts, the responder comes up, the ruleset loads, and with an empty
+ * allowlist both a direct connection and a name lookup fail. Throws on any
+ * failure — callers fail closed.
+ */
+export async function runFenceProbe(options: BuildFenceOptions = {}): Promise<void> {
+  const fence = await buildFenceCommand(
+    `/usr/bin/python3 -c ${shQuote(FENCE_PROBE_PY)}`,
+    [],
+    options,
   )
+  try {
+    const { code, stderr } = await new Promise<{ code: number | null; stderr: string }>(
+      (resolve, reject) => {
+        const child = spawn("/bin/sh", ["-c", fence.command], {
+          stdio: ["ignore", "ignore", "pipe"],
+        })
+        let stderr = ""
+        child.stderr?.on("data", (chunk) => {
+          if (stderr.length < 2000) stderr += String(chunk)
+        })
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL")
+          reject(new Error(`fence probe timed out after ${FENCE_PROBE_TIMEOUT_MS}ms`))
+        }, FENCE_PROBE_TIMEOUT_MS)
+        child.on("error", (err) => {
+          clearTimeout(timer)
+          reject(err)
+        })
+        child.on("close", (code) => {
+          clearTimeout(timer)
+          resolve({ code, stderr })
+        })
+      },
+    )
+    if (code === 0) return
+    if (code === 101) throw new Error("fence probe: a non-allowlisted address was reachable")
+    if (code === 102) throw new Error("fence probe: a non-allowlisted name resolved")
+    throw new Error(`fence probe failed (exit ${code}): ${stderr.trim() || "no output"}`)
+  } finally {
+    await fsPromises.rm(fence.dir, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 function executableAt(p: string): boolean {

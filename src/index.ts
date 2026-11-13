@@ -8,7 +8,13 @@ import {
   resolveConfig,
   type SandboxPluginConfig,
 } from "./config"
-import { buildFenceCommand, fenceDependenciesMissing, sweepFenceDirs } from "./fence"
+import {
+  buildFenceCommand,
+  fenceDependenciesMissing,
+  runFenceProbe,
+  runsWithNoNewPrivs,
+  sweepFenceDirs,
+} from "./fence"
 import { runEnforcementProbe } from "./probe"
 import { ENFORCEMENT_MESSAGE, ensureShim } from "./shim"
 import { cleanupOldToggleFiles, isSandboxToggledOff } from "./toggle"
@@ -111,6 +117,11 @@ export default Plugin.define({
       void sweepFenceDirs().then((removed) => {
         if (removed > 0) console.debug(`[opencode-sandbox] swept ${removed} stale fence dir(s)`)
       })
+      if (runsWithNoNewPrivs())
+        log(
+          "warn",
+          "opencode runs with no_new_privs: pasta cannot enter its SELinux domain (pasta_t) and runs unconfined; SELinux may report an nnp_transition denial per command",
+        )
     }
 
     const runtimeConfig = resolveConfig(projectDir, projectDir, userConfig)
@@ -121,6 +132,8 @@ export default Plugin.define({
         // Initialization only proves the runtime configured itself; the probe
         // proves seatbelt/bwrap actually enforce before the first real command.
         .then(() => runEnforcementProbe())
+        // The fence is part of enforcement too: prove it blocks egress.
+        .then(() => (fenced ? runFenceProbe({ warn: () => {} }) : undefined))
         .then(() => {
           console.debug(
             `[opencode-sandbox] initialized and enforcement verified — writes allowed in: ${runtimeConfig.filesystem?.allowWrite?.join(", ")}`,
@@ -140,12 +153,22 @@ export default Plugin.define({
     // runtime's per-command mount-point refcount.
     const sandboxShimPaths = new Set<string>()
 
-    // Fence scratch dirs by original command string; a "session.shell.ended"
-    // event carries the command, which lets the dir be removed even when the
-    // guest could not (a killed command). If an identical command is still
-    // running, its dir may be removed early — harmless, its files are all
-    // consumed before the user command starts.
-    const fenceDirsByCommand = new Map<string, Set<string>>()
+    // Fence scratch dirs per command string, oldest first. The create hook has
+    // no shell id, but a "session.shell.ended" event carries the command,
+    // which lets the dir be removed even when the guest could not (a killed
+    // command). Each ended event removes only the OLDEST dir of its key, so
+    // identical concurrent commands never lose a dir that is still being set
+    // up by a younger sibling.
+    const fenceDirsByCommand = new Map<string, string[]>()
+
+    // Skip warnings repeat for every command (the allowlist is re-parsed per
+    // command); report each distinct one once per plugin instance.
+    const fenceWarned = new Set<string>()
+    const warnFenceOnce = (message: string) => {
+      if (fenceWarned.has(message)) return
+      fenceWarned.add(message)
+      log("warn", message)
+    }
 
     const cleanupCommand = () => {
       try {
@@ -159,6 +182,11 @@ export default Plugin.define({
       if (await isSandboxToggledOff(projectDir)) return
       if (!invocation.command) return
 
+      // Set once the runtime counted this command as active (wrapWithSandbox)
+      // and cleared once a sandbox shim is handed out — from then on the
+      // shell "ended" event releases it. A failure in between must release it
+      // here, or the runtime defers its mount-point cleanup forever.
+      let pendingRelease = false
       try {
         if (!(await ensureSandboxReady())) throw new Error("sandbox initialization failed")
 
@@ -173,6 +201,7 @@ export default Plugin.define({
           undefined,
           { commandId: crypto.randomUUID(), commandText: invocation.command },
         )
+        pendingRelease = wrapped !== invocation.command
 
         // network.fenced: the runtime above ran with networking disabled (no
         // --unshare-net, no proxy), so this bwrap command is a pure filesystem
@@ -183,14 +212,11 @@ export default Plugin.define({
           const fence = await buildFenceCommand(
             wrapped,
             userConfig.network?.allowedDomains ?? DEFAULT_ALLOWED_DOMAINS,
-            { warn: (message) => log("warn", message) },
+            { denylist: userConfig.network?.deniedDomains, warn: warnFenceOnce },
           )
-          let fenceDirs = fenceDirsByCommand.get(invocation.command)
-          if (!fenceDirs) {
-            fenceDirs = new Set()
-            fenceDirsByCommand.set(invocation.command, fenceDirs)
-          }
-          fenceDirs.add(fence.dir)
+          const fenceDirs = fenceDirsByCommand.get(invocation.command) ?? []
+          fenceDirs.push(fence.dir)
+          fenceDirsByCommand.set(invocation.command, fenceDirs)
           wrapped = fence.command
         }
         // No restrictions apply to this command; skip the shim entirely.
@@ -198,6 +224,7 @@ export default Plugin.define({
 
         const shimPath = await ensureShim(invocation.shell, "sandbox")
         sandboxShimPaths.add(shimPath)
+        pendingRelease = false
         invocation.env = {
           ...invocation.env,
           OPENCODE_SANDBOX_REAL_SHELL: invocation.shell,
@@ -206,6 +233,7 @@ export default Plugin.define({
         invocation.shell = shimPath
       } catch (err) {
         log("error", `Failed to sandbox command; blocking it: ${messageOf(err)}`)
+        if (pendingRelease) cleanupCommand()
         try {
           invocation.shell = await ensureShim(invocation.shell, "blocked")
         } catch {
@@ -236,15 +264,14 @@ export default Plugin.define({
           const shell = result.value.data.shell
           if (sandboxShimPaths.has(shell.shell)) cleanupCommand()
           const fenceDirs = fenceDirsByCommand.get(shell.command)
-          if (fenceDirs) {
-            fenceDirsByCommand.delete(shell.command)
-            for (const fenceDir of fenceDirs) {
-              fsPromises
-                .rm(fenceDir, { recursive: true, force: true })
-                .catch((err) =>
-                  log("warn", `Failed to remove fence dir ${fenceDir}: ${messageOf(err)}`),
-                )
-            }
+          const fenceDir = fenceDirs?.shift()
+          if (fenceDir) {
+            if (fenceDirs?.length === 0) fenceDirsByCommand.delete(shell.command)
+            fsPromises
+              .rm(fenceDir, { recursive: true, force: true })
+              .catch((err) =>
+                log("warn", `Failed to remove fence dir ${fenceDir}: ${messageOf(err)}`),
+              )
           }
         }
       } catch {

@@ -511,6 +511,27 @@ describe("validateConfig", () => {
     expect(errors).toContain("network.fenced must be a boolean")
   })
 
+  test("rejects network.disabled together with network.fenced", () => {
+    const { errors } = validateConfig({ network: { fenced: true, disabled: true } })
+    expect(errors).toContain("network.disabled and network.fenced are mutually exclusive")
+    expect(validateConfig({ network: { fenced: true, disabled: false } }).errors).toEqual([])
+  })
+
+  test("warns about proxy-only network keys under network.fenced", () => {
+    const { errors, warnings } = validateConfig({
+      network: { fenced: true, allowLocalBinding: true, allowUnixSockets: ["/x"] },
+    })
+    expect(errors).toEqual([])
+    expect(warnings).toEqual([
+      "network.allowUnixSockets has no effect with network.fenced",
+      "network.allowLocalBinding has no effect with network.fenced",
+    ])
+    // deniedDomains is honored by the fence: no warning.
+    expect(
+      validateConfig({ network: { fenced: true, deniedDomains: ["x.org"] } }).warnings,
+    ).toEqual([])
+  })
+
   test("collects every structural error", () => {
     const { errors } = validateConfig({
       disabled: 1,

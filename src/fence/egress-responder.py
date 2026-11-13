@@ -9,11 +9,12 @@ sinkholes everything else. No privilege drop, no upstream, no daemon.
   usage:  egress-responder.py <port> <pinfile> [addr]
     pinfile: one allowed name per line ->
                 <name> <ip> [<ip> ...]
-          (a name absent from the pin file is sinkholed: A -> 0.0.0.0,
-           AAAA -> no records). This is the NAME gate of the egress model.
+          (a name absent from the pin file is sinkholed with NXDOMAIN). This is
+           the NAME gate of the egress model.
 
-Only A (1) and AAAA (28) queries are answered; anything else gets an empty
-answer. Single-question queries only (which is what resolvers send).
+Only A (1) and AAAA (28) queries of pinned names are answered; other qtypes of
+pinned names get an empty NOERROR answer. Single-question queries only (which
+is what resolvers send).
 """
 import socket
 import struct
@@ -49,7 +50,7 @@ def parse_question(pkt: bytes):
 def build_response(tid, question, answers, rcode=0) -> bytes:
     """answers: list of (rtype, rdata_bytes). The answer name is a pointer
     (0xC00C) back to the echoed question's QNAME at offset 12."""
-    flags = 0x8180  # QR=1, RD=1, RA=1, AA=1, rcode=0
+    flags = 0x8180 | (rcode & 0xF)  # QR=1, RD=1, RA=1, rcode
     header = tid + struct.pack(">HHHHH", flags, 1, len(answers), 0, 0)
     pkt = header + question
     for rtype, rdata in answers:
@@ -91,19 +92,19 @@ def main() -> int:
         except Exception:
             continue
         answers = []
-        if qtype == 1:  # A
-            ips = pins.get(qname)
-            if ips:
-                answers = [(1, socket.inet_aton(ip)) for ip in ips if ":" not in ip]
-            else:
-                answers = [(1, socket.inet_aton("0.0.0.0"))]  # sinkhole
+        rcode = 0
+        ips = pins.get(qname)
+        if not ips:
+            # Not allowlisted: NXDOMAIN. (A 0.0.0.0 sinkhole would point at
+            # the local host, and "unknown host" is the clearer failure.)
+            rcode = 3
+        elif qtype == 1:  # A
+            answers = [(1, socket.inet_aton(ip)) for ip in ips if ":" not in ip]
         elif qtype == 28:  # AAAA
-            ips = [ip for ip in pins.get(qname, []) if ":" in ip]
-            if ips:
-                answers = [(28, socket.inet_pton(socket.AF_INET6, ip)) for ip in ips]
+            answers = [(28, socket.inet_pton(socket.AF_INET6, ip)) for ip in ips if ":" in ip]
         # other qtypes: empty answer (ancount=0)
         try:
-            s.sendto(build_response(tid, question, answers), client)
+            s.sendto(build_response(tid, question, answers, rcode), client)
         except OSError:
             pass
     return 0

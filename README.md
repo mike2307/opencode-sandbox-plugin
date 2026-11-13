@@ -79,16 +79,16 @@ Without this fix, bwrap will fail with `loopback: Failed RTM_NEWADDR: Operation 
 
 ```bash
 # Debian/Ubuntu
-sudo apt install util-linux python3 nftables iproute2
+sudo apt install passt util-linux python3 nftables iproute2
 
 # Fedora
-sudo dnf install util-linux python3 nftables iproute
+sudo dnf install passt util-linux python3 nftables iproute
 
 # Arch
-sudo pacman -S util-linux python nftables iproute2
+sudo pacman -S passt util-linux python nftables iproute2
 ```
 
-The fence shells out to `pasta` and `unshare` (util-linux), `python3` (the DNS responder), `nft` (nftables), and `ip` (iproute2). If any are missing, commands are blocked with the missing tool named.
+The fence shells out to `pasta` and `unshare`/`mount` (util-linux), `/usr/bin/python3` (the DNS responder), `nft` (nftables), and `ip` (iproute2). If any are missing, commands are blocked with the missing tool named.
 
 ## What it does
 
@@ -162,11 +162,13 @@ Set `network.disabled: true` to run commands with **unrestricted network access*
 
 How it works: each command runs inside a `pasta` network namespace that the plugin creates for it and tears down afterwards. Three cooperating, unprivileged layers gate egress:
 
-1. **Name gate** — a minimal in-namespace DNS responder answers *only* the allowlisted domain names with the addresses the plugin resolved on the host for this command, and sinkholes every other name. Commands can only ever *learn* allowed destinations.
-2. **IP backstop** — an nftables policy-drop ruleset in the same namespace allows only loopback, the DNS endpoint, and the allowlisted destination IPs/CIDRs. Hardcoded IPs, DNS-over-HTTPS, or a rebinding that slips past the name gate still hit this wall.
+1. **Name gate** — a minimal in-namespace DNS responder answers *only* the allowlisted domain names with the addresses the plugin resolved on the host for this command, and answers every other name with NXDOMAIN. Commands can only ever *learn* allowed destinations.
+2. **IP backstop** — an nftables policy-drop ruleset (`inet`, so IPv6 is dropped too) in the same namespace allows only loopback, the DNS endpoint, and the allowlisted destination IPs/CIDRs. Hardcoded IPs, DNS-over-HTTPS, or a rebinding that slips past the name gate still hit this wall.
 3. **No proxy** — the runtime's bubblewrap sandbox runs with networking left to the fence (no `--unshare-net`, no proxy), so the two layers compose without fighting over the network namespace.
 
-The fence is **fail-closed**: if any of `pasta`, `python3`, `ip`, `nft`, `unshare` is missing, commands are blocked with the missing tool named; an allowlist entry the v1 fence cannot express is skipped (with a warning on the console), not silently downgraded; an empty effective allowlist allows nothing.
+pasta runs IPv4-only, without port forwarding in either direction and without mapping the gateway to the host: the namespace's `127.0.0.1` is its own, not the host's, so local host services are not reachable.
+
+The fence is **fail-closed**: if any of `pasta`, `ip`, `unshare`, `nft`, `mount`, `readlink` (in `PATH`) or `/usr/bin/bash`, `/usr/bin/python3`, `/bin/sh` is missing, commands are blocked with the missing tool named; at startup a probe runs a fenced command with an empty allowlist and blocks all commands unless the fence comes up and stops both a direct connection and a name lookup; an allowlist entry the v1 fence cannot express is skipped (with a warning on the console, once per entry), not silently downgraded; an empty effective allowlist allows nothing.
 
 v1 allowlist entry support (entries come from `allowedDomains`, same as the proxy model):
 
@@ -174,7 +176,13 @@ v1 allowlist entry support (entries come from `allowedDomains`, same as the prox
 - IPv4 literals and CIDRs (e.g. `10.17.146.234`, `10.16.59.0/24`)
 - *not supported yet*: `*.domain` wildcards, `:port` suffixes, IPv6 — such entries are skipped with a warning, so prefer exact domains for now
 
-`fenced` takes precedence over `allowedDomains` for the *runtime* (the allowlist is consumed by the fence, not the proxy); filesystem sandboxing and the whole-sandbox switches behave exactly as with `disabled`. The fence is Linux-only — on other platforms `fenced: true` blocks all commands with a message.
+`deniedDomains` narrows the allowlist: denied exact domains and `*.domain` wildcards are never pinned, denied IPv4 literals/CIDRs are dropped ahead of every allow rule (e.g. inside an allowed CIDR).
+
+Limitations: DNS is answered over UDP only; pinned addresses are fixed for the command's lifetime, so a very long-running command does not follow DNS changes.
+
+`fenced` takes precedence over `allowedDomains` for the *runtime* (the allowlist is consumed by the fence, not the proxy); filesystem sandboxing and the whole-sandbox switches behave exactly as with `disabled`. `fenced` and `network.disabled` are mutually exclusive (setting both is a config error); `allowUnixSockets`, `allowAllUnixSockets` and `allowLocalBinding` have no effect with `fenced` (Unix sockets stay blocked by the seccomp filter). The fence is Linux-only — on other platforms `fenced: true` blocks all commands with a message.
+
+**SELinux note:** pasta normally runs in its own SELinux domain (`pasta_t`). If opencode itself runs with `no_new_privs` (e.g. started from inside another sandbox, or a systemd unit with `NoNewPrivileges=`), that domain transition is denied: pasta still works, but runs unconfined and SELinux reports an `nnp_transition nosuid_transition` denial for each command. The plugin warns about this at startup; start opencode without `no_new_privs` to avoid it.
 
 ### IP addresses and network ranges (CIDR)
 

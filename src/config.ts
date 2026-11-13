@@ -204,8 +204,21 @@ export function validateConfig(config: unknown): { errors: string[]; warnings: s
       warnings.push(`ignoring unknown key "${key}"`)
     }
   }
+  const network = isObject(config.network) ? config.network : undefined
+  if (network?.fenced === true) {
+    // Ambiguous: unrestricted network vs. the fence. Fail closed.
+    if (network.disabled === true)
+      errors.push("network.disabled and network.fenced are mutually exclusive")
+    for (const subKey of FENCE_IGNORED_KEYS)
+      if (subKey in network) warnings.push(`network.${subKey} has no effect with network.fenced`)
+  }
   return { errors, warnings }
 }
+
+/** Proxy-model network keys the fence does not use (Unix sockets stay blocked
+ * by the runtime's seccomp filter; local binding is always possible inside
+ * the fence's own network namespace). */
+const FENCE_IGNORED_KEYS = ["allowUnixSockets", "allowAllUnixSockets", "allowLocalBinding"]
 
 /** Apply validation to a parsed config, throwing on structural errors so the
  * caller fails closed instead of silently weakening to defaults. */

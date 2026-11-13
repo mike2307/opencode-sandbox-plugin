@@ -23,14 +23,21 @@ mock.module("../src/probe", () => ({ runEnforcementProbe: mockRunEnforcementProb
 // parsing, file assembly, and the pasta command shape live in test/fence.test.ts.
 const FENCE_TEST_DIR = "/tmp/opencode-fence-plugin-test"
 const FENCE_TEST_COMMAND = `pasta --config-net --runas test /usr/bin/bash '${FENCE_TEST_DIR}/guest.sh'`
-const mockBuildFenceCommand = mock((_wrapped: string, _allowlist: string[]) =>
-  Promise.resolve({ command: FENCE_TEST_COMMAND, dir: FENCE_TEST_DIR }),
+const mockBuildFenceCommand = mock(
+  (
+    _wrapped: string,
+    _allowlist: string[],
+    _options?: { denylist?: string[]; warn?: (m: string) => void },
+  ) => Promise.resolve({ command: FENCE_TEST_COMMAND, dir: FENCE_TEST_DIR }),
 )
 const mockFenceDependenciesMissing = mock(() => [] as string[])
 const mockSweepFenceDirs = mock(() => Promise.resolve(0))
+const mockRunFenceProbe = mock(() => Promise.resolve())
 mock.module("../src/fence", () => ({
   buildFenceCommand: mockBuildFenceCommand,
   fenceDependenciesMissing: mockFenceDependenciesMissing,
+  runFenceProbe: mockRunFenceProbe,
+  runsWithNoNewPrivs: () => false,
   sweepFenceDirs: mockSweepFenceDirs,
   FENCE_DIR_PREFIX: "opencode-fence-",
 }))
@@ -158,6 +165,8 @@ describe("plugin", () => {
     mockFenceDependenciesMissing.mockImplementation(() => [] as string[])
     mockSweepFenceDirs.mockReset()
     mockSweepFenceDirs.mockImplementation(() => Promise.resolve(0))
+    mockRunFenceProbe.mockReset()
+    mockRunFenceProbe.mockImplementation(() => Promise.resolve())
     fs.rmSync(FENCE_TEST_DIR, { recursive: true, force: true })
     delete process.env.OPENCODE_DISABLE_SANDBOX
     delete process.env.OPENCODE_SANDBOX_CONFIG
@@ -365,6 +374,7 @@ describe("plugin", () => {
     expect(mockBuildFenceCommand).toHaveBeenCalledTimes(1)
     expect(mockBuildFenceCommand.mock.calls[0][0]).toBe("srt-wrapped: echo hello")
     expect(mockBuildFenceCommand.mock.calls[0][1]).toEqual(["pypi.org"])
+    expect(mockRunFenceProbe).toHaveBeenCalledTimes(1)
     expect(invocation.command).toBe("echo hello")
     expect(invocation.shell).toBe(path.join(shimDir(), "sandbox", "bash"))
     expect(invocation.env.OPENCODE_SANDBOX_WRAPPED_COMMAND).toBe(FENCE_TEST_COMMAND)
@@ -395,6 +405,57 @@ describe("plugin", () => {
     expect(invocation.shell).toContain(path.join(shimDir(), "blocked"))
     expect(fs.readFileSync(invocation.shell, "utf8")).toContain("pasta")
     expect(mockBuildFenceCommand).not.toHaveBeenCalled()
+  })
+
+  test("fenced releases the runtime's command count when the fence cannot be built", async () => {
+    if (process.platform !== "linux") return
+    mockBuildFenceCommand.mockImplementation(() => Promise.reject(new Error("ENOSPC")))
+    process.env.OPENCODE_SANDBOX_CONFIG = JSON.stringify({ network: { fenced: true } })
+    const { hooks } = await setupPlugin()
+    const invocation = makeInvocation()
+
+    await hooks["create.before"]?.(invocation)
+
+    // Blocked, and the wrap's refcount released right away: no sandbox shim
+    // was handed out, so no "ended" event would ever release it.
+    expect(invocation.shell).toContain(path.join(shimDir(), "blocked"))
+    expect(mockCleanupAfterCommand).toHaveBeenCalledTimes(1)
+  })
+
+  test("fenced blocks commands when the fence probe fails", async () => {
+    if (process.platform !== "linux") return
+    mockRunFenceProbe.mockImplementation(() => Promise.reject(new Error("no userns")))
+    process.env.OPENCODE_SANDBOX_CONFIG = JSON.stringify({ network: { fenced: true } })
+    const { hooks } = await setupPlugin()
+    const invocation = makeInvocation()
+
+    await hooks["create.before"]?.(invocation)
+
+    expect(invocation.shell).toContain(path.join(shimDir(), "blocked"))
+    expect(mockBuildFenceCommand).not.toHaveBeenCalled()
+  })
+
+  test("fenced passes deniedDomains and reports each skip warning once", async () => {
+    if (process.platform !== "linux") return
+    mockBuildFenceCommand.mockImplementation((_w, _a, options) => {
+      options?.warn?.("fence: ignoring allowlist entry *.x.org")
+      return Promise.resolve({ command: FENCE_TEST_COMMAND, dir: FENCE_TEST_DIR })
+    })
+    process.env.OPENCODE_SANDBOX_CONFIG = JSON.stringify({
+      network: { fenced: true, allowedDomains: ["*.x.org"], deniedDomains: ["evil.org"] },
+    })
+    const warn = console.warn
+    const warnings: string[] = []
+    console.warn = (m: string) => warnings.push(m)
+    try {
+      const { hooks } = await setupPlugin()
+      await hooks["create.before"]?.(makeInvocation())
+      await hooks["create.before"]?.(makeInvocation())
+    } finally {
+      console.warn = warn
+    }
+    expect(mockBuildFenceCommand.mock.calls[0][2]?.denylist).toEqual(["evil.org"])
+    expect(warnings.filter((m) => m.includes("*.x.org"))).toHaveLength(1)
   })
 
   test("fenced respects the toggle", async () => {
@@ -435,6 +496,33 @@ describe("plugin", () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 10))
     expect(fs.existsSync(FENCE_TEST_DIR)).toBe(false)
+  })
+
+  test("fenced removes only the oldest dir of identical concurrent commands", async () => {
+    if (process.platform !== "linux") return
+    const first = `${FENCE_TEST_DIR}-1`
+    const second = `${FENCE_TEST_DIR}-2`
+    const dirs = [first, second]
+    mockBuildFenceCommand.mockImplementation(() =>
+      Promise.resolve({ command: FENCE_TEST_COMMAND, dir: dirs.shift() as string }),
+    )
+    process.env.OPENCODE_SANDBOX_CONFIG = JSON.stringify({ network: { fenced: true } })
+    const { hooks, bus } = await setupPlugin()
+    const a = makeInvocation()
+    const b = makeInvocation()
+    await hooks["create.before"]?.(a)
+    await hooks["create.before"]?.(b)
+    for (const d of [first, second]) fs.mkdirSync(d, { recursive: true })
+
+    const ended = { sessionID: "s1", shell: { shell: a.shell, command: a.command } }
+    bus.push({ type: "session.shell.ended", data: ended })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(fs.existsSync(first)).toBe(false)
+    expect(fs.existsSync(second)).toBe(true)
+
+    bus.push({ type: "session.shell.ended", data: ended })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(fs.existsSync(second)).toBe(false)
   })
 
   test("cleans up once per sandboxed shell on session.shell.ended", async () => {
