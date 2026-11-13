@@ -1,11 +1,14 @@
+import fsPromises from "node:fs/promises"
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime"
 import { Plugin } from "@opencode/plugin"
 import {
+  DEFAULT_ALLOWED_DOMAINS,
   isSandboxGloballyDisabled,
   loadConfig,
   resolveConfig,
   type SandboxPluginConfig,
 } from "./config"
+import { buildFenceCommand, fenceDependenciesMissing, sweepFenceDirs } from "./fence"
 import { runEnforcementProbe } from "./probe"
 import { ENFORCEMENT_MESSAGE, ensureShim } from "./shim"
 import { cleanupOldToggleFiles, isSandboxToggledOff } from "./toggle"
@@ -69,6 +72,47 @@ export default Plugin.define({
       }
     }
 
+    const fenced = userConfig.network?.fenced === true
+    if (fenced && process.platform !== "linux") {
+      log("error", "network.fenced requires Linux (pasta + nftables); commands will be blocked")
+      const registration = await ctx.shell.hook("create.before", async (invocation) => {
+        if (await isSandboxToggledOff(projectDir)) return
+        invocation.shell = await ensureShim(
+          invocation.shell,
+          "blocked",
+          "opencode-sandbox: network.fenced requires Linux — command blocked",
+        )
+      })
+      return () => {
+        void registration.dispose()
+      }
+    }
+    if (fenced) {
+      const missing = fenceDependenciesMissing()
+      if (missing.length > 0) {
+        log(
+          "error",
+          `network.fenced is enabled but ${missing.join(", ")} is missing (or not in PATH); commands will be blocked`,
+        )
+        const registration = await ctx.shell.hook("create.before", async (invocation) => {
+          if (await isSandboxToggledOff(projectDir)) return
+          invocation.shell = await ensureShim(
+            invocation.shell,
+            "blocked",
+            `opencode-sandbox: network.fenced requires ${missing.join(", ")} — command blocked`,
+          )
+        })
+        return () => {
+          void registration.dispose()
+        }
+      }
+      // Scratch dirs left behind by commands that were killed before the guest
+      // could remove its own dir.
+      void sweepFenceDirs().then((removed) => {
+        if (removed > 0) console.debug(`[opencode-sandbox] swept ${removed} stale fence dir(s)`)
+      })
+    }
+
     const runtimeConfig = resolveConfig(projectDir, projectDir, userConfig)
 
     let initialization: Promise<boolean> | undefined
@@ -96,6 +140,13 @@ export default Plugin.define({
     // runtime's per-command mount-point refcount.
     const sandboxShimPaths = new Set<string>()
 
+    // Fence scratch dirs by original command string; a "session.shell.ended"
+    // event carries the command, which lets the dir be removed even when the
+    // guest could not (a killed command). If an identical command is still
+    // running, its dir may be removed early — harmless, its files are all
+    // consumed before the user command starts.
+    const fenceDirsByCommand = new Map<string, Set<string>>()
+
     const cleanupCommand = () => {
       try {
         SandboxManager.cleanupAfterCommand()
@@ -115,13 +166,33 @@ export default Plugin.define({
         // directory so sandbox rules track where commands actually run.
         const invocationConfig = resolveConfig(invocation.cwd, invocation.cwd, userConfig)
 
-        const wrapped = await SandboxManager.wrapWithSandbox(
+        let wrapped = await SandboxManager.wrapWithSandbox(
           invocation.command,
           invocation.shell,
           { filesystem: invocationConfig.filesystem },
           undefined,
           { commandId: crypto.randomUUID(), commandText: invocation.command },
         )
+
+        // network.fenced: the runtime above ran with networking disabled (no
+        // --unshare-net, no proxy), so this bwrap command is a pure filesystem
+        // sandbox. Wrap it in the per-command pasta fence, which owns the
+        // network namespace (pinned resolver + egress allowlist); the bwrap
+        // command inherits that netns and the bind-mounted resolver overrides.
+        if (fenced) {
+          const fence = await buildFenceCommand(
+            wrapped,
+            userConfig.network?.allowedDomains ?? DEFAULT_ALLOWED_DOMAINS,
+            { warn: (message) => log("warn", message) },
+          )
+          let fenceDirs = fenceDirsByCommand.get(invocation.command)
+          if (!fenceDirs) {
+            fenceDirs = new Set()
+            fenceDirsByCommand.set(invocation.command, fenceDirs)
+          }
+          fenceDirs.add(fence.dir)
+          wrapped = fence.command
+        }
         // No restrictions apply to this command; skip the shim entirely.
         if (wrapped === invocation.command) return
 
@@ -162,7 +233,19 @@ export default Plugin.define({
           const result = await Promise.race([iterator.next(), stoppedPromise.then(() => stop)])
           if (result.done) break
           if (result.value.type !== "session.shell.ended") continue
-          if (sandboxShimPaths.has(result.value.data.shell.shell)) cleanupCommand()
+          const shell = result.value.data.shell
+          if (sandboxShimPaths.has(shell.shell)) cleanupCommand()
+          const fenceDirs = fenceDirsByCommand.get(shell.command)
+          if (fenceDirs) {
+            fenceDirsByCommand.delete(shell.command)
+            for (const fenceDir of fenceDirs) {
+              fsPromises
+                .rm(fenceDir, { recursive: true, force: true })
+                .catch((err) =>
+                  log("warn", `Failed to remove fence dir ${fenceDir}: ${messageOf(err)}`),
+                )
+            }
+          }
         }
       } catch {
         // Stream closed (server shutdown or plugin teardown); nothing to clean.

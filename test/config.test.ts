@@ -196,6 +196,23 @@ describe("resolveConfig", () => {
 
     expect(config.network?.allowedDomains).toBeUndefined()
   })
+
+  test("network.fenced also disables the runtime network (the plugin owns it)", () => {
+    const user: SandboxPluginConfig = {
+      network: {
+        fenced: true,
+        allowedDomains: ["github.com"],
+      },
+    }
+    const config = resolveConfig(PROJECT_DIR, WORKTREE, user)
+
+    // No allow list reaches the runtime → no --unshare-net, no proxy: the
+    // bwrap command is a pure filesystem sandbox the fence nests in pasta.
+    // The user's allowedDomains are consumed by the fence (src/fence.ts), not
+    // the runtime.
+    expect(config.network?.allowedDomains).toBeUndefined()
+    expect(config.network?.deniedDomains).toEqual([])
+  })
 })
 
 describe("loadConfig", () => {
@@ -479,6 +496,19 @@ describe("validateConfig", () => {
   test("rejects a non-boolean network.disabled", () => {
     const { errors } = validateConfig({ network: { disabled: "yes" } })
     expect(errors).toContain("network.disabled must be a boolean")
+  })
+
+  test("accepts network.fenced as a boolean", () => {
+    const { errors, warnings } = validateConfig({
+      network: { fenced: true, allowedDomains: ["github.com"] },
+    })
+    expect(errors).toEqual([])
+    expect(warnings).toEqual([])
+  })
+
+  test("rejects a non-boolean network.fenced", () => {
+    const { errors } = validateConfig({ network: { fenced: "yes" } })
+    expect(errors).toContain("network.fenced must be a boolean")
   })
 
   test("collects every structural error", () => {

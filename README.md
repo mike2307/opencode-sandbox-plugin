@@ -75,6 +75,21 @@ bwrap --ro-bind / / --dev /dev --proc /proc -- echo "sandbox works"
 
 Without this fix, bwrap will fail with `loopback: Failed RTM_NEWADDR: Operation not permitted` or `setting up uid map: Permission denied`.
 
+**3. (Only for the network fence)** If you use `network.fenced: true`, the fence needs a few more tools on the host, in addition to bubblewrap:
+
+```bash
+# Debian/Ubuntu
+sudo apt install util-linux python3 nftables iproute2
+
+# Fedora
+sudo dnf install util-linux python3 nftables iproute
+
+# Arch
+sudo pacman -S util-linux python nftables iproute2
+```
+
+The fence shells out to `pasta` and `unshare` (util-linux), `python3` (the DNS responder), `nft` (nftables), and `ip` (iproute2). If any are missing, commands are blocked with the missing tool named.
+
 ## What it does
 
 When the agent runs a command, the sandbox enforces three layers of protection:
@@ -125,6 +140,41 @@ Set `network.disabled: true` to run commands with **unrestricted network access*
 ```
 
 `disabled` takes precedence over `allowedDomains`/`deniedDomains` in the same block (they are ignored). Filesystem sandboxing is unaffected; the whole-sandbox switches (top-level `disabled: true`, `OPENCODE_DISABLE_SANDBOX=1`, and "Toggle Sandbox") still disable *everything*, network included.
+
+### Network fence (proxy-less egress allowlist, Linux)
+
+`network.fenced: true` replaces the proxy-based network sandbox with a **per-command network fence** built on `pasta` — no `HTTP(S)_PROXY` injection, no proxy process, no app-level hooks. Filesystem sandboxing (bubblewrap) stays fully in place and nests inside the fence:
+
+```json
+{
+  "network": {
+    "fenced": true,
+    "allowedDomains": [
+      "registry.npmjs.org",
+      "pypi.org",
+      "github.com",
+      "10.16.59.0/24",
+      "10.17.146.234"
+    ]
+  }
+}
+```
+
+How it works: each command runs inside a `pasta` network namespace that the plugin creates for it and tears down afterwards. Three cooperating, unprivileged layers gate egress:
+
+1. **Name gate** — a minimal in-namespace DNS responder answers *only* the allowlisted domain names with the addresses the plugin resolved on the host for this command, and sinkholes every other name. Commands can only ever *learn* allowed destinations.
+2. **IP backstop** — an nftables policy-drop ruleset in the same namespace allows only loopback, the DNS endpoint, and the allowlisted destination IPs/CIDRs. Hardcoded IPs, DNS-over-HTTPS, or a rebinding that slips past the name gate still hit this wall.
+3. **No proxy** — the runtime's bubblewrap sandbox runs with networking left to the fence (no `--unshare-net`, no proxy), so the two layers compose without fighting over the network namespace.
+
+The fence is **fail-closed**: if any of `pasta`, `python3`, `ip`, `nft`, `unshare` is missing, commands are blocked with the missing tool named; an allowlist entry the v1 fence cannot express is skipped (with a warning on the console), not silently downgraded; an empty effective allowlist allows nothing.
+
+v1 allowlist entry support (entries come from `allowedDomains`, same as the proxy model):
+
+- exact domains (e.g. `registry.npmjs.org`) — resolved on the host when the command's fence is set up, pinned for that command's lifetime
+- IPv4 literals and CIDRs (e.g. `10.17.146.234`, `10.16.59.0/24`)
+- *not supported yet*: `*.domain` wildcards, `:port` suffixes, IPv6 — such entries are skipped with a warning, so prefer exact domains for now
+
+`fenced` takes precedence over `allowedDomains` for the *runtime* (the allowlist is consumed by the fence, not the proxy); filesystem sandboxing and the whole-sandbox switches behave exactly as with `disabled`. The fence is Linux-only — on other platforms `fenced: true` blocks all commands with a message.
 
 ### IP addresses and network ranges (CIDR)
 

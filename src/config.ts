@@ -14,6 +14,7 @@ export interface SandboxPluginConfig {
   }
   network?: {
     disabled?: boolean
+    fenced?: boolean
     allowedDomains?: string[]
     deniedDomains?: string[]
     allowUnixSockets?: string[]
@@ -36,7 +37,7 @@ const DEFAULT_DENY_READ_DIRS = [
   ".env",
 ]
 
-const DEFAULT_ALLOWED_DOMAINS = [
+export const DEFAULT_ALLOWED_DOMAINS = [
   "registry.npmjs.org",
   "*.npmjs.org",
   "registry.yarnpkg.com",
@@ -126,25 +127,30 @@ export function resolveConfig(
         ? userDenyWrite.map((p) => resolveUserPath(p, canonicalProjectDir))
         : [],
     },
-    network: user?.network?.disabled
-      ? // Disabled: omit allowedDomains so the runtime sets needsNetworkProxy to
-        // false — no --unshare-net namespace, no proxy env injection, host
-        // network used directly. The public type marks the field required, but
-        // every runtime read goes through `?.` / `?? []`, so its absence is safe.
-        ({ deniedDomains: [] } as unknown as SandboxRuntimeConfig["network"])
-      : {
-          allowedDomains: user?.network?.allowedDomains ?? DEFAULT_ALLOWED_DOMAINS,
-          deniedDomains: user?.network?.deniedDomains ?? [],
-          allowUnixSockets: user?.network?.allowUnixSockets,
-          allowAllUnixSockets: user?.network?.allowAllUnixSockets,
-          allowLocalBinding: user?.network?.allowLocalBinding ?? false,
-        },
+    network:
+      user?.network?.disabled || user?.network?.fenced
+        ? // Disabled OR fenced: omit allowedDomains so the runtime sets
+          // needsNetworkRestriction to false — no --unshare-net namespace, no
+          // proxy env injection, host network used directly by bwrap. For
+          // fenced, the plugin separately owns the network via a pasta sidecar
+          // (src/fence.ts); the runtime must not touch the network. The public
+          // type marks the field required, but every runtime read goes through
+          // `?.` / `?? []`, so its absence is safe.
+          ({ deniedDomains: [] } as unknown as SandboxRuntimeConfig["network"])
+        : {
+            allowedDomains: user?.network?.allowedDomains ?? DEFAULT_ALLOWED_DOMAINS,
+            deniedDomains: user?.network?.deniedDomains ?? [],
+            allowUnixSockets: user?.network?.allowUnixSockets,
+            allowAllUnixSockets: user?.network?.allowAllUnixSockets,
+            allowLocalBinding: user?.network?.allowLocalBinding ?? false,
+          },
   }
 }
 
 const FILESYSTEM_KEYS = new Set(["denyRead", "allowRead", "allowWrite", "denyWrite"])
 const NETWORK_KEYS = new Set([
   "disabled",
+  "fenced",
   "allowedDomains",
   "deniedDomains",
   "allowUnixSockets",
@@ -186,7 +192,8 @@ export function validateConfig(config: unknown): { errors: string[]; warnings: s
         } else if (
           subKey === "allowAllUnixSockets" ||
           subKey === "allowLocalBinding" ||
-          subKey === "disabled"
+          subKey === "disabled" ||
+          subKey === "fenced"
         ) {
           if (typeof subValue !== "boolean") errors.push(`${key}.${subKey} must be a boolean`)
         } else if (!isStringArray(subValue)) {

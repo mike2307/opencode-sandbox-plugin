@@ -20,9 +20,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "bun build ./src/index.ts ./src/tui.tsx --outdir dist --target node --format esm --external @anthropic-ai/sandbox-runtime --external @opencode/plugin --external '@opencode/plugin/*' --external @opentui/core --external '@opentui/*' --external solid-js && bun x tsc --emitDeclarationOnly --declaration --outDir dist",
-    "test": "sh -c 'for f in test/*.test.ts; do bun test \"$f\" || exit 1; done'",
-    "test:coverage": "sh -c 'for f in test/*.test.ts; do bun test --coverage \"$f\" || exit 1; done'",
+    "build": "bun build ./src/index.ts ./src/tui.tsx --outdir dist --target node --format esm --external @anthropic-ai/sandbox-runtime --external @opencode/plugin --external '@opencode/plugin/*' --external @opentui/core --external '@opentui/*' --external solid-js && bun x tsc --emitDeclarationOnly --declaration --outDir dist && mkdir -p dist/fence && cp src/fence/egress-responder.py dist/fence/egress-responder.py",
+    "test": "bun test --isolate",
+    "test:coverage": "bun test --coverage --isolate",
     "lint": "biome lint .",
     "format": "biome format .",
     "format:fix": "biome format --write .",
