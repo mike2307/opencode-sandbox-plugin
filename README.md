@@ -162,7 +162,7 @@ Set `network.disabled: true` to run commands with **unrestricted network access*
 
 How it works: each command runs inside a `pasta` network namespace that the plugin creates for it and tears down afterwards. Three cooperating, unprivileged layers gate egress:
 
-1. **Name gate** — a minimal in-namespace DNS responder answers *only* the allowlisted domain names with the addresses the plugin resolved on the host for this command, and answers every other name with NXDOMAIN. Commands can only ever *learn* allowed destinations.
+1. **Name gate** — a minimal in-namespace DNS responder answers *only* what the allowlist permits: pinned domain names with the addresses the plugin resolved on the host for this command, and — for `*.domain` entries — strict subdomains vouched on demand by a host-side resolver that runs alongside the fence (and opens the egress ruleset for the addresses it answers). Every other name gets NXDOMAIN. Commands can only ever *learn* allowed destinations.
 2. **IP backstop** — an nftables policy-drop ruleset (`inet`, so IPv6 is dropped too) in the same namespace allows only loopback, the DNS endpoint, and the allowlisted destination IPs/CIDRs. Hardcoded IPs, DNS-over-HTTPS, or a rebinding that slips past the name gate still hit this wall.
 3. **No proxy** — the runtime's bubblewrap sandbox runs with networking left to the fence (no `--unshare-net`, no proxy), so the two layers compose without fighting over the network namespace.
 
@@ -173,12 +173,13 @@ The fence is **fail-closed**: if any of `pasta`, `ip`, `unshare`, `nft`, `mount`
 v1 allowlist entry support (entries come from `allowedDomains`, same as the proxy model):
 
 - exact domains (e.g. `registry.npmjs.org`) — resolved on the host when the command's fence is set up, pinned for that command's lifetime
+- `*.domain` wildcards (e.g. `*.github.com`) — strict subdomains are resolved on demand by the fence's host-side upstream resolver and vouched into the egress ruleset per address; over-broad bases (a single label, as in `*.com`) are rejected
 - IPv4 literals and CIDRs (e.g. `10.17.146.234`, `10.16.59.0/24`)
-- *not supported yet*: `*.domain` wildcards, `:port` suffixes, IPv6 — such entries are skipped with a warning, so prefer exact domains for now
+- *not supported yet*: `:port` suffixes, IPv6 — such entries are skipped with a warning
 
-`deniedDomains` narrows the allowlist: denied exact domains and `*.domain` wildcards are never pinned, denied IPv4 literals/CIDRs are dropped ahead of every allow rule (e.g. inside an allowed CIDR).
+`deniedDomains` narrows the allowlist: denied exact domains and `*.domain` wildcards are never pinned, denied IPv4 literals/CIDRs are dropped ahead of every allow rule (e.g. inside an allowed CIDR), and `*` (deny-all) leaves no domain entry pinned while raw IP/CIDR entries stay effective — the same as the proxy model, where `*` matches names, not IP destinations.
 
-Limitations: DNS is answered over UDP only; pinned addresses are fixed for the command's lifetime, so a very long-running command does not follow DNS changes.
+Limitations: DNS is answered over UDP only; pinned addresses — and the addresses vouched for wildcard subdomains — are fixed for the command's lifetime, so a very long-running command does not follow DNS changes.
 
 `fenced` takes precedence over `allowedDomains` for the *runtime* (the allowlist is consumed by the fence, not the proxy); filesystem sandboxing and the whole-sandbox switches behave exactly as with `disabled`. `fenced` and `network.disabled` are mutually exclusive (setting both is a config error); `allowUnixSockets`, `allowAllUnixSockets` and `allowLocalBinding` have no effect with `fenced` (Unix sockets stay blocked by the seccomp filter). The fence is Linux-only — on other platforms `fenced: true` blocks all commands with a message.
 

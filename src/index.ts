@@ -1,4 +1,3 @@
-import fsPromises from "node:fs/promises"
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime"
 import { Plugin } from "@opencode/plugin"
 import {
@@ -11,6 +10,7 @@ import {
 import {
   buildFenceCommand,
   fenceDependenciesMissing,
+  releaseFenceDir,
   runFenceProbe,
   runsWithNoNewPrivs,
   sweepFenceDirs,
@@ -267,11 +267,9 @@ export default Plugin.define({
           const fenceDir = fenceDirs?.shift()
           if (fenceDir) {
             if (fenceDirs?.length === 0) fenceDirsByCommand.delete(shell.command)
-            fsPromises
-              .rm(fenceDir, { recursive: true, force: true })
-              .catch((err) =>
-                log("warn", `Failed to remove fence dir ${fenceDir}: ${messageOf(err)}`),
-              )
+            releaseFenceDir(fenceDir).catch((err) =>
+              log("warn", `Failed to remove fence dir ${fenceDir}: ${messageOf(err)}`),
+            )
           }
         }
       } catch {

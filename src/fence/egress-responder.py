@@ -3,8 +3,8 @@
 egress-responder.py — minimal in-netns DNS pinning responder (opencode-sandbox
 fence asset).
 
-A deliberately tiny UDP DNS server that answers ONLY what a pin file says, and
-sinkholes everything else. No privilege drop, no upstream, no daemon.
+A deliberately tiny UDP DNS server that answers ONLY what a pin file says and
+NXDOMAINs everything else. No privilege drop, no upstream, no daemon.
 
   usage:  egress-responder.py <port> <pinfile> [addr]
     pinfile: one allowed name per line ->
@@ -12,10 +12,15 @@ sinkholes everything else. No privilege drop, no upstream, no daemon.
           (a name absent from the pin file is sinkholed with NXDOMAIN). This is
            the NAME gate of the egress model.
 
-Only A (1) and AAAA (28) queries of pinned names are answered; other qtypes of
-pinned names get an empty NOERROR answer. Single-question queries only (which
-is what resolvers send).
+Only A (1) and AAAA (28) queries are answered. Pinned names are answered from
+the pin file. Non-pinned names that are strict subdomains of a wildcard base
+(<dir>/wildcards.txt, next to the pin file) are vouched on demand through the
+fence agent (unix socket <dir>/agent.sock) — which asks the host-side upstream
+resolver and opens the egress ruleset for the answered addresses — anything
+else is NXDOMAIN. Single-question queries only (which is what resolvers send).
 """
+import os
+import re
 import socket
 import struct
 import sys
@@ -60,6 +65,45 @@ def build_response(tid, question, answers, rcode=0) -> bytes:
     return pkt
 
 
+def load_wildcard_bases(pinfile):
+    """Wildcard bases from <dir>/wildcards.txt (next to the pin file), one
+    `*.domain` per line; unparseable lines drop."""
+    base_dir = os.path.dirname(os.path.abspath(pinfile))
+    try:
+        with open(os.path.join(base_dir, "wildcards.txt")) as f:
+            return [
+                line.strip()[2:].lower()
+                for line in f
+                if line.strip().startswith("*.")
+                and re.match(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", line.strip()[2:])
+            ]
+    except OSError:
+        return []
+
+
+def matches_wildcard(name, bases):
+    """Strict subdomain of a base (the base itself is not a match)."""
+    return any(name.endswith("." + b) and name.count(".") > b.count(".") for b in bases)
+
+
+def query_agent(sock_path, name, qtype):
+    """One vouch request to the in-netns agent. (2, []) when it is not there."""
+    try:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(7.0)
+        conn.connect(sock_path)
+        conn.sendall(f"{name} {qtype}\n".encode())
+        line = conn.makefile("rb").readline()
+        conn.close()
+        parts = line.decode().strip().split("\t")
+        if not parts:
+            # Agent closed without answering (should not happen): fail closed.
+            return 2, []
+        return int(parts[0]), (parts[1].split() if len(parts) > 1 else [])
+    except (OSError, ValueError):
+        return 2, []
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print(__doc__)
@@ -67,6 +111,8 @@ def main() -> int:
     port = int(sys.argv[1])
     pinfile = sys.argv[2]
     addr = sys.argv[3] if len(sys.argv) > 3 else "127.0.0.1"
+    base_dir = os.path.dirname(os.path.abspath(pinfile))
+    agent_sock = os.path.join(base_dir, "agent.sock")
 
     pins = {}
     with open(pinfile) as f:
@@ -77,9 +123,14 @@ def main() -> int:
             parts = line.split()
             pins.setdefault(parts[0].lower(), []).extend(parts[1:])
 
+    bases = load_wildcard_bases(pinfile)
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind((addr, port))
-    sys.stderr.write(f"responder listening on {addr}:{port}, {len(pins)} pinned name(s)\n")
+    sys.stderr.write(
+        f"responder listening on {addr}:{port}, {len(pins)} pinned name(s), "
+        f"{len(bases)} wildcard base(s)\n"
+    )
     sys.stderr.flush()
 
     while True:
@@ -95,14 +146,24 @@ def main() -> int:
         rcode = 0
         ips = pins.get(qname)
         if not ips:
-            # Not allowlisted: NXDOMAIN. (A 0.0.0.0 sinkhole would point at
-            # the local host, and "unknown host" is the clearer failure.)
-            rcode = 3
-        elif qtype == 1:  # A
-            answers = [(1, socket.inet_aton(ip)) for ip in ips if ":" not in ip]
-        elif qtype == 28:  # AAAA
-            answers = [(28, socket.inet_pton(socket.AF_INET6, ip)) for ip in ips if ":" in ip]
-        # other qtypes: empty answer (ancount=0)
+            # Not pinned. A strict subdomain of an allowlisted wildcard base
+            # is vouched on demand through the agent (upstream resolver +
+            # egress rule); everything else is NXDOMAIN. (A 0.0.0.0 sinkhole
+            # would point at the local host, and "unknown host" is the
+            # clearer failure.)
+            if agent_sock and bases and matches_wildcard(qname, bases):
+                rcode, ips = query_agent(agent_sock, qname, qtype)
+            else:
+                rcode = 3
+        if rcode == 0 and ips:
+            if qtype == 1:  # A
+                answers = [(1, socket.inet_aton(ip)) for ip in ips if ":" not in ip]
+            elif qtype == 28:  # AAAA
+                answers = [
+                    (28, socket.inet_pton(socket.AF_INET6, ip)) for ip in ips if ":" in ip
+                ]
+            # other qtypes: empty answer (ancount=0)
+        # rcode 2 (SERVFAIL) and 3 (NXDOMAIN) answer with no records
         try:
             s.sendto(build_response(tid, question, answers, rcode), client)
         except OSError:

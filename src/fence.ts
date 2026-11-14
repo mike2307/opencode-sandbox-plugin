@@ -35,6 +35,8 @@ export type FenceSkip = { entry: string; reason: string }
 export type FenceParsed = {
   /** exact domains resolved to their pinned IPv4 addresses (name gate). */
   pins: FencePin[]
+  /** `*.domain` wildcard bases: strict subdomains are resolved on demand. */
+  wildcards: string[]
   /** IPv4 literals and CIDRs, ready for nft (IP backstop). */
   networks: string[]
   /** entries the v1 fence cannot express, with the reason. */
@@ -47,6 +49,7 @@ export type Resolve4 = (name: string) => Promise<string[]>
 export type FenceEntry =
   | { kind: "domain"; name: string }
   | { kind: "network"; value: string }
+  | { kind: "wildcard"; base: string }
   | { kind: "skip"; entry: string; reason: string }
 
 const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
@@ -60,12 +63,21 @@ const validOctets = (octets: string[]) => octets.every((o) => Number(o) <= 255)
 export function parseFenceEntry(raw: string): FenceEntry {
   const entry = raw.trim()
   if (!entry) return { kind: "skip", entry, reason: "empty entry" }
-  if (entry.includes("*"))
+  if (entry.includes("*")) {
+    // `*.domain` is the only wildcard form: subdomains are resolved on
+    // demand. Over-broad bases (a single label, as in `*.com`) are refused
+    // exactly like the runtime schema refuses them.
+    const wildcard = entry.match(/^\*\.(.+)$/)
+    if (wildcard && wildcard[1].includes(".") && DOMAIN_RE.test(wildcard[1]))
+      return { kind: "wildcard", base: wildcard[1].toLowerCase() }
     return {
       kind: "skip",
       entry,
-      reason: "wildcard domains are not supported by the v1 fence",
+      reason: wildcard
+        ? "overly broad wildcard (the base needs at least two labels)"
+        : "wildcard domains must be of the form *.domain",
     }
+  }
   // A colon means either a port suffix (name:port / ip:port) or IPv6; neither
   // is expressible in v1 (the fence pins whole destinations, without per-port
   // or IPv6 rules).
@@ -107,6 +119,7 @@ export async function parseFenceAllowlist(
 ): Promise<FenceParsed> {
   const pins: FencePin[] = []
   const networks: string[] = []
+  const wildcards: string[] = []
   const skips: FenceSkip[] = []
   const seenNetworks = new Set<string>()
   const parsedEntries = entries.map(parseFenceEntry)
@@ -128,6 +141,7 @@ export async function parseFenceAllowlist(
     ),
   )
   const seenPins = new Set<string>()
+  const seenWildcards = new Set<string>()
   for (const entry of parsedEntries) {
     if (entry.kind === "skip") {
       skips.push({ entry: entry.entry, reason: entry.reason })
@@ -137,6 +151,13 @@ export async function parseFenceAllowlist(
       if (!seenNetworks.has(entry.value)) {
         seenNetworks.add(entry.value)
         networks.push(entry.value)
+      }
+      continue
+    }
+    if (entry.kind === "wildcard") {
+      if (!seenWildcards.has(entry.base)) {
+        seenWildcards.add(entry.base)
+        wildcards.push(entry.base)
       }
       continue
     }
@@ -154,7 +175,7 @@ export async function parseFenceAllowlist(
     }
     pins.push({ name: entry.name, ips: v4 })
   }
-  return { pins, networks, skips }
+  return { pins, wildcards, networks, skips }
 }
 
 export type FenceDenied = {
@@ -162,6 +183,9 @@ export type FenceDenied = {
   names: Set<string>
   /** `*.domain` suffixes (".domain"): no subdomain of these is pinned. */
   suffixes: string[]
+  /** `*`: no domain allowlist entry is pinned (raw IP/CIDR entries are kept,
+   * as the proxy model denies names, not raw IPs). */
+  allNames: boolean
   /** IPv4 literals and CIDRs: dropped ahead of every accept rule. */
   networks: string[]
   /** entries the v1 fence cannot express. */
@@ -171,12 +195,24 @@ export type FenceDenied = {
 /**
  * Classify deniedDomains for the fence. Denials only ever narrow the
  * allowlist: a denied name is never pinned (so it gets NXDOMAIN), a denied
- * IPv4/CIDR is dropped by nft even inside an allowed CIDR.
+ * IPv4/CIDR is dropped by nft even inside an allowed CIDR, and `*` (deny-all)
+ * leaves no domain entry pinned while raw IP/CIDR entries stay effective —
+ * the same as the proxy model, where `*` matches names, not IP destinations.
  */
 export function parseFenceDenylist(entries: string[]): FenceDenied {
-  const denied: FenceDenied = { names: new Set(), suffixes: [], networks: [], skips: [] }
+  const denied: FenceDenied = {
+    names: new Set(),
+    suffixes: [],
+    allNames: false,
+    networks: [],
+    skips: [],
+  }
   for (const raw of entries) {
     const entry = raw.trim()
+    if (entry === "*") {
+      denied.allNames = true
+      continue
+    }
     const wildcard = entry.match(/^\*\.(.+)$/)
     if (wildcard && DOMAIN_RE.test(wildcard[1])) {
       denied.suffixes.push(`.${wildcard[1].toLowerCase()}`)
@@ -185,6 +221,10 @@ export function parseFenceDenylist(entries: string[]): FenceDenied {
     const parsed = parseFenceEntry(entry)
     if (parsed.kind === "domain") denied.names.add(parsed.name)
     else if (parsed.kind === "network") denied.networks.push(parsed.value)
+    else if (parsed.kind === "wildcard")
+      // Unreachable in practice (valid wildcards were matched above), but the
+      // deny semantics of one are a suffix denial.
+      denied.suffixes.push(`.${parsed.base}`)
     else denied.skips.push({ entry: parsed.entry, reason: parsed.reason })
   }
   return denied
@@ -201,9 +241,9 @@ function ipv4Valid(ip: string): boolean {
   return !!m && validOctets(m.slice(1, 5))
 }
 
-/** The egress-responder asset bundled with the plugin (dist/fence/ in the build). */
-function responderAssetPath(): string {
-  return path.join(path.dirname(fileURLToPath(import.meta.url)), "fence", "egress-responder.py")
+/** The fence python assets bundled with the plugin (dist/fence/ in the build). */
+function fenceAssetPath(name: string): string {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), "fence", name)
 }
 
 export type FenceCommand = {
@@ -237,7 +277,10 @@ export async function buildFenceCommand(
   for (const skip of denied.skips)
     warn(`[opencode-sandbox] fence: ignoring denylist entry ${skip.entry} — ${skip.reason}`)
   const parsed = await parseFenceAllowlist(
-    allowlist.filter((entry) => !isDeniedName(entry, denied)),
+    allowlist.filter((entry) => {
+      if (denied.allNames && parseFenceEntry(entry).kind === "domain") return false
+      return !isDeniedName(entry, denied)
+    }),
     options.resolve4,
   )
   for (const skip of parsed.skips)
@@ -245,18 +288,23 @@ export async function buildFenceCommand(
 
   const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), FENCE_DIR_PREFIX))
   try {
-    const responder = await fsPromises.readFile(responderAssetPath())
+    const responder = await fsPromises.readFile(fenceAssetPath("egress-responder.py"))
+    const upstream = await fsPromises.readFile(fenceAssetPath("upstream-resolver.py"))
+    const agent = await fsPromises.readFile(fenceAssetPath("fence-agent.py"))
     // bwrap runs as guest root in the pasta namespace: the seccomp helper's
     // nested user namespace needs CAP_SETFCAP to map uid 0 (kernels >= 5.12).
     const wrappedInGuest = fenceCapabilityFix(wrapped)
     await Promise.all([
       fsPromises.writeFile(path.join(dir, "egress-responder.py"), responder),
+      fsPromises.writeFile(path.join(dir, "upstream-resolver.py"), upstream),
+      fsPromises.writeFile(path.join(dir, "fence-agent.py"), agent),
       fsPromises.writeFile(path.join(dir, "guest.sh"), GUEST_SH),
       fsPromises.writeFile(path.join(dir, "setup.sh"), NAMESPACE_SETUP_SH),
       fsPromises.writeFile(path.join(dir, "runner.sh"), MOUNT_RUNNER_SH),
       fsPromises.writeFile(path.join(dir, "resolv.conf"), RESOLV_CONF),
       fsPromises.writeFile(path.join(dir, "nsswitch.conf"), NSSWITCH_CONF),
       fsPromises.writeFile(path.join(dir, "pin.txt"), pinLines(parsed.pins)),
+      fsPromises.writeFile(path.join(dir, "wildcards.txt"), wildcardLines(parsed.wildcards)),
       fsPromises.writeFile(path.join(dir, "nft.rules"), nftRules(parsed, denied.networks)),
       // The wrapped command is already a fully quoted command line
       // (the runtime quotes every word with POSIX single quotes); as the body
@@ -268,7 +316,7 @@ export async function buildFenceCommand(
     throw err
   }
   return {
-    command: fenceCommand(dir),
+    command: fenceCommand(dir, os.userInfo().username, parsed.wildcards.length > 0),
     dir,
   }
 }
@@ -300,16 +348,23 @@ export function fenceCapabilityFix(wrapped: string): string {
   return wrapped.slice(0, at + "--cap-drop ALL".length) + " --cap-add CAP_SETFCAP" + after
 }
 
-/** The exact pasta invocation for a scratch dir (exported for tests). */
-export function fenceCommand(dir: string, username: string = os.userInfo().username): string {
+/** The fence command for a scratch dir (exported for tests). With wildcard
+ * entries the command also manages the host-side upstream resolver: it starts
+ * it before pasta, fails closed if it does not come up, and kills it after. */
+export function fenceCommand(
+  dir: string,
+  username: string = os.userInfo().username,
+  withWildcardDaemon = false,
+): string {
   // Entry command is an ABSOLUTE /usr/bin/bash on purpose: a bare name would
   // make pasta execvp() it, whose PATH search hits ~/.local/bin — a `search`
   // the pasta_t SELinux domain is denied.
   //
   // The guest inherits pasta's stdio, so stderr must NOT be redirected here
   // (it would swallow the command's own stderr); --quiet drops pasta's info
-  // chatter instead.
-  return [
+  // chatter instead. The wrapper lines redirect only the DAEMON's stderr
+  // (its own log file), never pasta's.
+  const pasta = [
     "pasta",
     ...PASTA_FENCE_OPTIONS,
     "--runas",
@@ -317,6 +372,31 @@ export function fenceCommand(dir: string, username: string = os.userInfo().usern
     "/usr/bin/bash",
     shQuote(path.join(dir, "guest.sh")),
   ].join(" ")
+  if (!withWildcardDaemon) return pasta
+  const upLog = shQuote(path.join(dir, "up.log"))
+  const upPid = shQuote(path.join(dir, "upstream.pid"))
+  return [
+    `/usr/bin/python3 ${shQuote(path.join(dir, "upstream-resolver.py"))} ${shQuote(dir)} >${upLog} 2>&1 &`,
+    "UP_PID=$!",
+    `echo "$UP_PID" >${upPid}`,
+    // Wait for the daemon's readiness line instead of a fixed delay.
+    'READY=""',
+    "for i in $(seq 1 250); do",
+    `  grep -q "^upstream listening" ${upLog} 2>/dev/null && { READY=1; break; }`,
+    '  kill -0 "$UP_PID" 2>/dev/null || break',
+    "  sleep 0.02",
+    "done",
+    'if [ -z "$READY" ]; then',
+    '  kill "$UP_PID" 2>/dev/null',
+    '  echo "opencode-sandbox fence: the upstream resolver did not come up:" >&2',
+    `  cat ${upLog} >&2`,
+    "  exit 1",
+    "fi",
+    pasta,
+    "rc=$?",
+    'kill "$UP_PID" 2>/dev/null',
+    'exit "$rc"',
+  ].join("\n")
 }
 
 /**
@@ -355,6 +435,12 @@ export const PASTA_FENCE_OPTIONS = [
 function pinLines(pins: FencePin[]): string {
   if (pins.length === 0) return ""
   return `${pins.map((pin) => `${pin.name} ${pin.ips.join(" ")}`).join("\n")}\n`
+}
+
+/** One `*.domain` per line; empty when the allowlist has no wildcards. */
+function wildcardLines(wildcards: string[]): string {
+  if (wildcards.length === 0) return ""
+  return `${wildcards.map((base) => `*.${base}`).join("\n")}\n`
 }
 
 function nftRules(parsed: FenceParsed, deniedNetworks: string[] = []): string {
@@ -412,6 +498,23 @@ export async function sweepFenceDirs(
   return removed
 }
 
+/**
+ * Terminate a fence scratch dir's host-side upstream resolver daemon, if one
+ * is still alive (the wrapper kills it on every exit path it reaches; this
+ * covers a SIGKILLed command). Reads the pid the wrapper wrote, signals
+ * SIGTERM, and removes the dir.
+ */
+export async function releaseFenceDir(dir: string): Promise<void> {
+  try {
+    const raw = await fsPromises.readFile(path.join(dir, "upstream.pid"), "utf8")
+    const pid = Number(raw.trim())
+    if (Number.isInteger(pid) && pid > 0) process.kill(pid, "SIGTERM")
+  } catch {
+    // no daemon (no wildcards) or already gone
+  }
+  await fsPromises.rm(dir, { recursive: true, force: true })
+}
+
 /** Tools the fence needs from PATH, in the order the guest uses them. */
 export const FENCE_DEPENDENCIES = ["pasta", "ip", "unshare", "nft", "mount", "readlink"]
 
@@ -449,9 +552,58 @@ export function runsWithNoNewPrivs(statusFile = "/proc/self/status"): boolean {
   }
 }
 
+/**
+ * SIGKILL the process rooted at rootPid plus all its descendants (best effort:
+ * a process may exit between the scan and the kill). Used when the fence
+ * probe times out: killing the probe's pasta alone would orphan the guest it
+ * runs in a fresh PID namespace — host-pidns descendants either way — which
+ * would keep the (empty-allowlist) fence machinery alive past the probe. On
+ * non-Linux (no /proc) this degenerates to killing only the root.
+ */
+export function killProcessTree(rootPid: number): void {
+  const children = new Map<number, number[]>()
+  try {
+    for (const name of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue
+      const pid = Number(name)
+      if (pid === rootPid) continue
+      try {
+        // comm is parenthesized and may contain spaces or parens, so cut
+        // after the LAST ")"; PPid is the second field of what follows.
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8")
+        const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1])
+        if (!Number.isInteger(ppid)) continue
+        const siblings = children.get(ppid) ?? []
+        siblings.push(pid)
+        children.set(ppid, siblings)
+      } catch {
+        // the process exited mid-scan
+      }
+    }
+  } catch {
+    // not Linux; the plain kill below is all that is possible
+  }
+  const doomed: number[] = []
+  const stack = [rootPid]
+  while (stack.length > 0) {
+    const pid = stack.pop() as number
+    doomed.push(pid)
+    for (const child of children.get(pid) ?? []) stack.push(child)
+  }
+  for (const pid of doomed.reverse()) {
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch {
+      // already gone
+    }
+  }
+}
+
 // Probe workload, run INSIDE the fence with an empty allowlist: egress to a
 // public address must fail (101 otherwise) and a lookup must be refused by
-// the name gate (102 otherwise).
+// the name gate (102 otherwise). The probed name is under .invalid (RFC
+// 2606, never delegated), so it cannot sit in a host /etc/hosts entry —
+// `hosts: files` consults the host's file, which the fence does not override.
 const FENCE_PROBE_PY = [
   "import socket, sys",
   "s = socket.socket()",
@@ -462,7 +614,7 @@ const FENCE_PROBE_PY = [
   "except OSError:",
   "    pass",
   "try:",
-  '    socket.getaddrinfo("example.com", 443)',
+  '    socket.getaddrinfo("opencode-sandbox-probe.invalid", 443)',
   "    sys.exit(102)",
   "except OSError:",
   "    pass",
@@ -493,7 +645,10 @@ export async function runFenceProbe(options: BuildFenceOptions = {}): Promise<vo
           if (stderr.length < 2000) stderr += String(chunk)
         })
         const timer = setTimeout(() => {
-          child.kill("SIGKILL")
+          // SIGKILLing the child (pasta) alone would orphan the guest it
+          // spawned in a fresh PID namespace; kill the whole tree instead.
+          if (child.pid !== undefined) killProcessTree(child.pid)
+          else child.kill("SIGKILL")
           reject(new Error(`fence probe timed out after ${FENCE_PROBE_TIMEOUT_MS}ms`))
         }, FENCE_PROBE_TIMEOUT_MS)
         child.on("error", (err) => {

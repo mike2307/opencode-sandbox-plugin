@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test"
 import fs from "node:fs"
+import fsPromises from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
@@ -33,9 +34,13 @@ const mockBuildFenceCommand = mock(
 const mockFenceDependenciesMissing = mock(() => [] as string[])
 const mockSweepFenceDirs = mock(() => Promise.resolve(0))
 const mockRunFenceProbe = mock(() => Promise.resolve())
+const mockReleaseFenceDir = mock((dir: string) =>
+  fsPromises.rm(dir, { recursive: true, force: true }),
+)
 mock.module("../src/fence", () => ({
   buildFenceCommand: mockBuildFenceCommand,
   fenceDependenciesMissing: mockFenceDependenciesMissing,
+  releaseFenceDir: mockReleaseFenceDir,
   runFenceProbe: mockRunFenceProbe,
   runsWithNoNewPrivs: () => false,
   sweepFenceDirs: mockSweepFenceDirs,

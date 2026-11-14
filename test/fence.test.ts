@@ -10,6 +10,7 @@ import {
   fenceCapabilityFix,
   fenceCommand,
   fenceDependenciesMissing,
+  killProcessTree,
   PASTA_FENCE_OPTIONS,
   parseFenceAllowlist,
   parseFenceDenylist,
@@ -31,7 +32,8 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  process.env.TMPDIR = ORIGINAL_TMPDIR
+  if (ORIGINAL_TMPDIR === undefined) delete process.env.TMPDIR
+  else process.env.TMPDIR = ORIGINAL_TMPDIR
   await fsPromises.rm(TEST_TMP, { recursive: true, force: true }).catch(() => {})
 })
 
@@ -59,10 +61,17 @@ describe("parseFenceEntry", () => {
     expect(parseFenceEntry("10.0.0/24").kind).toBe("skip")
   })
 
-  test("skips wildcards (v1 has no wildcard pinning)", () => {
-    const entry = parseFenceEntry("*.github.com")
-    expect(entry.kind).toBe("skip")
-    if (entry.kind === "skip") expect(entry.reason).toContain("wildcard")
+  test("parses *.domain wildcards; refuses over-broad and other star forms", () => {
+    expect(parseFenceEntry("*.github.com")).toEqual({ kind: "wildcard", base: "github.com" })
+    expect(parseFenceEntry("*.API.GitHub.COM")).toEqual({
+      kind: "wildcard",
+      base: "api.github.com",
+    })
+    const overbroad = parseFenceEntry("*.com")
+    expect(overbroad.kind).toBe("skip")
+    if (overbroad.kind === "skip") expect(overbroad.reason).toContain("overly broad")
+    expect(parseFenceEntry("*").kind).toBe("skip")
+    expect(parseFenceEntry("*x.com").kind).toBe("skip")
   })
 
   test("skips port-suffixed entries (v1 allows whole destinations)", () => {
@@ -126,9 +135,10 @@ describe("parseFenceAllowlist", () => {
       { name: "registry.npmjs.org", ips: ["104.16.0.34", "104.16.1.34"] },
       { name: "pypi.org", ips: ["151.101.0.223"] },
     ])
+    expect(parsed.wildcards).toEqual(["github.com"])
     expect(parsed.networks).toEqual(["10.16.59.0/24", "10.17.146.234"])
     const skipEntries = parsed.skips.map((s) => s.entry)
-    expect(skipEntries).toEqual(["*.github.com", "unresolvable.invalid", "empty.invalid", "::1"])
+    expect(skipEntries).toEqual(["unresolvable.invalid", "empty.invalid", "::1"])
   })
 
   test("dedupes repeated domains (one resolution each) and networks", async () => {
@@ -148,7 +158,7 @@ describe("parseFenceAllowlist", () => {
 
   test("an empty allowlist yields an empty fence (fail-closed)", async () => {
     const parsed = await parseFenceAllowlist([], fakeResolve4)
-    expect(parsed).toEqual({ pins: [], networks: [], skips: [] })
+    expect(parsed).toEqual({ pins: [], wildcards: [], networks: [], skips: [] })
   })
 })
 
@@ -210,19 +220,37 @@ describe("buildFenceCommand", () => {
       { resolve4: fakeResolve4, warn: () => {} },
     )
     try {
-      expect(command).toBe(
+      const lines = command.split("\n")
+      // With a wildcard entry, the wrapper manages the upstream resolver:
+      // start it, wait for readiness, run pasta, kill it, keep its exit code.
+      expect(lines[0]).toContain("upstream-resolver.py")
+      expect(lines[0]).toContain(`>'${path.join(dir, "up.log")}' 2>&1 &`)
+      expect(lines[1]).toBe("UP_PID=$!")
+      expect(lines).toContain(
+        `  grep -q "^upstream listening" '${path.join(dir, "up.log")}' 2>/dev/null && { READY=1; break; }`,
+      )
+      // The pasta line itself stays clean: no stderr redirect (the guest
+      // inherits pasta's stdio), no chatter.
+      const pastaLine = lines.find((line) => line.startsWith("pasta")) as string
+      expect(pastaLine).toBe(
         `pasta ${PASTA_FENCE_OPTIONS.join(" ")} --runas '${os.userInfo().username}' /usr/bin/bash '${path.join(dir, "guest.sh")}'`,
       )
+      expect(pastaLine).not.toContain("2>")
+      expect(lines[lines.length - 2]).toBe('kill "$UP_PID" 2>/dev/null')
+      expect(lines[lines.length - 1]).toBe('exit "$rc"')
 
       const files = await fsPromises.readdir(dir)
       for (const name of [
         "egress-responder.py",
+        "upstream-resolver.py",
+        "fence-agent.py",
         "guest.sh",
         "setup.sh",
         "runner.sh",
         "resolv.conf",
         "nsswitch.conf",
         "pin.txt",
+        "wildcards.txt",
         "nft.rules",
         "wrapped.sh",
       ])
@@ -231,6 +259,10 @@ describe("buildFenceCommand", () => {
       // The name gate: pinned names + resolved IPs.
       expect(await fsPromises.readFile(path.join(dir, "pin.txt"), "utf8")).toBe(
         "registry.npmjs.org 104.16.0.34 104.16.1.34\n",
+      )
+      // Wildcard bases are written for the daemon/agent, not the ruleset.
+      expect(await fsPromises.readFile(path.join(dir, "wildcards.txt"), "utf8")).toBe(
+        "*.github.com\n",
       )
 
       // The IP backstop: policy drop, dns endpoint, pinned IPs, CIDRs.
@@ -245,7 +277,8 @@ describe("buildFenceCommand", () => {
       expect(rules).toContain("ip daddr 104.16.0.34 accept")
       expect(rules).toContain("ip daddr 104.16.1.34 accept")
       expect(rules).toContain("ip daddr 10.16.59.0/24 accept")
-      // Nothing may leak into the ruleset: the wildcard was skipped.
+      // Nothing may leak into the ruleset: the wildcard adds no static rule
+      // (its subdomains are vouched into rules at runtime, per address).
       expect(rules).not.toContain("github")
 
       // Resolver + NSS overrides for the mount ns.
@@ -262,12 +295,14 @@ describe("buildFenceCommand", () => {
         "#!/bin/sh\nexec /usr/bin/bwrap --ro-bind / / -- /bin/bash -c 'echo hi'\n",
       )
 
-      // The responder asset is copied byte-exact.
-      const responder = await fsPromises.readFile(path.join(dir, "egress-responder.py"))
-      const source = await fsPromises.readFile(
-        path.join(import.meta.dirname, "..", "src", "fence", "egress-responder.py"),
-      )
-      expect(responder.equals(source)).toBe(true)
+      // The python assets are copied byte-exact.
+      for (const asset of ["egress-responder.py", "upstream-resolver.py", "fence-agent.py"]) {
+        const copied = await fsPromises.readFile(path.join(dir, asset))
+        const source = await fsPromises.readFile(
+          path.join(import.meta.dirname, "..", "src", "fence", asset),
+        )
+        expect(copied.equals(source)).toBe(true)
+      }
 
       // The static scripts are byte-exact templates: no shell brace
       // interpolation could have been swallowed by the JS template literal.
@@ -290,12 +325,12 @@ describe("buildFenceCommand", () => {
     const warnings: string[] = []
     const { dir } = await buildFenceCommand(
       "/usr/bin/bwrap -- true",
-      ["*.example.org", "bad host", "unresolvable.invalid", "::1"],
+      ["*.org", "bad host", "unresolvable.invalid", "::1"],
       { resolve4: fakeResolve4, warn: (m) => warnings.push(m) },
     )
     try {
       expect(warnings).toHaveLength(4)
-      expect(warnings.join("\n")).toContain("wildcard")
+      expect(warnings.join("\n")).toContain("overly broad")
       expect(warnings.join("\n")).toContain("not a valid hostname")
       expect(warnings.join("\n")).toContain("resolution failed")
       expect(warnings.join("\n")).toContain("IPv6")
@@ -328,6 +363,22 @@ describe("buildFenceCommand", () => {
       expect(drop).toBeGreaterThan(-1)
       expect(accept).toBeGreaterThan(drop)
       expect(warnings).toEqual([expect.stringContaining("ignoring denylist entry ::1")])
+    } finally {
+      await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test("deniedDomains ['*'] unpins every domain but keeps raw IP entries", async () => {
+    const { dir } = await buildFenceCommand(
+      "/usr/bin/bwrap -- true",
+      ["registry.npmjs.org", "10.0.0.0/8"],
+      { denylist: ["*"], resolve4: fakeResolve4, warn: () => {} },
+    )
+    try {
+      expect(await fsPromises.readFile(path.join(dir, "pin.txt"), "utf8")).toBe("")
+      expect(await fsPromises.readFile(path.join(dir, "nft.rules"), "utf8")).toContain(
+        "add rule inet egress output ip daddr 10.0.0.0/8 accept",
+      )
     } finally {
       await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
     }
@@ -378,6 +429,32 @@ describe("fenceCommand", () => {
     expect(command).not.toContain("2>")
     expect(command.split("\n")).toHaveLength(1)
   })
+
+  test("manages the upstream resolver when wildcard entries are present", () => {
+    const command = fenceCommand("/tmp/opencode-fence-abc", "user", true)
+    const lines = command.split("\n")
+    // Daemon first: start, record the pid, wait for its readiness line.
+    expect(lines[0]).toBe(
+      `/usr/bin/python3 '/tmp/opencode-fence-abc/upstream-resolver.py' '/tmp/opencode-fence-abc' >'/tmp/opencode-fence-abc/up.log' 2>&1 &`,
+    )
+    expect(lines[1]).toBe("UP_PID=$!")
+    expect(lines[2]).toBe("echo \"$UP_PID\" >'/tmp/opencode-fence-abc/upstream.pid'")
+    expect(lines.some((l) => l.includes('grep -q "^upstream listening"'))).toBe(true)
+    // Fail closed when the daemon does not come up.
+    expect(lines).toContain(
+      '  echo "opencode-sandbox fence: the upstream resolver did not come up:" >&2',
+    )
+    expect(lines).toContain("  exit 1")
+    // The pasta line is untouched (no stderr redirect of its own); the
+    // daemon is killed after, and pasta's exit status is preserved.
+    const pastaIdx = lines.findIndex((l) => l.startsWith("pasta"))
+    expect(lines[pastaIdx]).toBe(
+      `pasta ${PASTA_FENCE_OPTIONS.join(" ")} --runas 'user' /usr/bin/bash '/tmp/opencode-fence-abc/guest.sh'`,
+    )
+    expect(lines[pastaIdx + 1]).toBe("rc=$?")
+    expect(lines[lines.length - 2]).toBe('kill "$UP_PID" 2>/dev/null')
+    expect(lines[lines.length - 1]).toBe('exit "$rc"')
+  })
 })
 
 describe("fenceDependenciesMissing", () => {
@@ -406,7 +483,71 @@ describe("parseFenceDenylist", () => {
     expect([...denied.names]).toEqual(["evil.com"])
     expect(denied.suffixes).toEqual([".corp.local"])
     expect(denied.networks).toEqual(["10.1.0.0/16"])
+    expect(denied.allNames).toBe(false)
     expect(denied.skips.map((s) => s.entry)).toEqual(["x.com:22"])
+  })
+  test("treats '*' as deny-all names, not as a skip", () => {
+    const denied = parseFenceDenylist(["*"])
+    expect(denied.allNames).toBe(true)
+    expect(denied.names).toEqual(new Set())
+    expect(denied.skips).toEqual([])
+  })
+})
+
+describe("killProcessTree", () => {
+  const descendantsOf = (root: number): number[] => {
+    const byParent = new Map<number, number[]>()
+    for (const name of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue
+      const pid = Number(name)
+      if (pid === root) continue
+      try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8")
+        const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1])
+        if (Number.isInteger(ppid)) byParent.set(ppid, [...(byParent.get(ppid) ?? []), pid])
+      } catch {
+        // gone mid-scan
+      }
+    }
+    const out: number[] = []
+    const stack = [root]
+    while (stack.length > 0) {
+      const pid = stack.pop() as number
+      for (const child of byParent.get(pid) ?? []) {
+        out.push(child)
+        stack.push(child)
+      }
+    }
+    return out
+  }
+
+  test("kills the descendants, not just the root", async () => {
+    if (process.platform !== "linux") return
+    const child = Bun.spawn(["/bin/sh", "-c", "sleep 60 & sleep 60 & wait"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    })
+    try {
+      // Wait for both grandchildren to show up under the shell.
+      for (let i = 0; i < 100 && descendantsOf(child.pid as number).length < 2; i++)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      const doomed = descendantsOf(child.pid as number)
+      expect(doomed).toHaveLength(2)
+      killProcessTree(child.pid as number)
+      // Everyone below the root is gone, and so is the root.
+      for (let i = 0; i < 100; i++) {
+        if (
+          !fs.existsSync(`/proc/${child.pid}`) &&
+          doomed.every((pid) => !fs.existsSync(`/proc/${pid}`))
+        )
+          return
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      const alive = [child.pid, ...doomed].filter((pid) => fs.existsSync(`/proc/${pid}`))
+      expect(alive).toEqual([])
+    } finally {
+      child.kill()
+    }
   })
 })
 
@@ -420,6 +561,37 @@ describe("runsWithNoNewPrivs", () => {
     expect(runsWithNoNewPrivs(path.join(TEST_TMP, "missing"))).toBe(false)
   })
 })
+
+// AF_UNIX may be unavailable where the tests run (the sandbox-runtime
+// seccomp filter blocks socket(AF_UNIX) for processes inside bwrap — which is
+// where agent commands, and often dev sessions, execute). The fence's own
+// components run OUTSIDE bwrap, where unix sockets are fine.
+let unixAvail: boolean | undefined
+const unixSocketsAvailable = async () => {
+  if (unixAvail !== undefined) return unixAvail
+  if (!fs.existsSync("/usr/bin/python3")) {
+    unixAvail = false
+    return unixAvail
+  }
+  const p = Bun.spawn(
+    [
+      "/usr/bin/python3",
+      "-c",
+      "import socket; socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).close(); print('ok')",
+    ],
+    { stdout: "pipe", stderr: "ignore" },
+  )
+  let out = ""
+  const reader = p.stdout.getReader()
+  for (;;) {
+    const { value, done } = await reader.read()
+    if (done) break
+    out += new TextDecoder().decode(value)
+  }
+  await p.exited
+  unixAvail = out.includes("ok")
+  return unixAvail
+}
 
 describe("egress-responder", () => {
   test("answers pinned names and NXDOMAINs everything else", async () => {
@@ -460,6 +632,124 @@ describe("egress-responder", () => {
       expect(blocked.answers).toBe(0)
     } finally {
       child.kill()
+    }
+  })
+
+  test("vouches wildcard-matched names through the agent socket", async () => {
+    if (!fs.existsSync("/usr/bin/python3") || !(await unixSocketsAvailable())) return
+    const dir = path.join(TEST_TMP, "resp-wc")
+    await fsPromises.mkdir(dir, { recursive: true })
+    await fsPromises.writeFile(path.join(dir, "pin.txt"), "")
+    await fsPromises.writeFile(path.join(dir, "wildcards.txt"), "*.invalid\n")
+    // Fake agent: answers every request with one fixed address.
+    const fakeAgent = [
+      "import socket, sys, os",
+      "p = sys.argv[1]",
+      "try: os.unlink(p)",
+      "except OSError: pass",
+      "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(p); s.listen(1)",
+      "sys.stderr.write('fake-agent up\\n'); sys.stderr.flush()",
+      "while True:",
+      "    c, _ = s.accept()",
+      "    f = c.makefile('rb')",
+      "    while True:",
+      "        line = f.readline()",
+      "        if not line: break",
+      "        c.sendall(b'0\\t93.184.215.16\\n')",
+      "    c.close()",
+    ].join("\n")
+    const agent = Bun.spawn(["/usr/bin/python3", "-c", fakeAgent, path.join(dir, "agent.sock")], {
+      stderr: "pipe",
+    })
+    const port = 20000 + (process.pid % 20000)
+    const script = path.join(import.meta.dirname, "..", "src", "fence", "egress-responder.py")
+    const child = Bun.spawn(
+      ["/usr/bin/python3", script, String(port), path.join(dir, "pin.txt"), "127.0.0.1"],
+      { stderr: "pipe" },
+    )
+    try {
+      const agentLine = await agent.stderr.getReader().read()
+      expect(new TextDecoder().decode(agentLine.value as Uint8Array)).toStartWith("fake-agent up")
+      const respLine = await child.stderr.getReader().read()
+      expect(new TextDecoder().decode(respLine.value as Uint8Array)).toStartWith(
+        "responder listening",
+      )
+      const query = (name: string, qtype: number) => {
+        const labels = name.split(".").flatMap((l) => [l.length, ...Buffer.from(l)])
+        return Buffer.from([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, ...labels, 0, 0, qtype, 0, 1])
+      }
+      const ask = async (name: string, qtype: number) => {
+        const { promise, resolve } = Promise.withResolvers<Buffer>()
+        const socket = await Bun.udpSocket({
+          socket: { data: (_s, data) => resolve(Buffer.from(data)) },
+        })
+        socket.send(query(name, qtype), port, "127.0.0.1")
+        const reply = await promise
+        socket.close()
+        return { rcode: reply[3] & 0xf, answers: reply.readUInt16BE(6), tail: reply.subarray(-4) }
+      }
+      // A strict subdomain of the wildcard base is answered (by the agent).
+      const vouched = await ask("unit-test.invalid", 1)
+      expect(vouched.rcode).toBe(0)
+      expect(vouched.answers).toBe(1)
+      expect([...vouched.tail]).toEqual([93, 184, 215, 16])
+      // The base itself is not a subdomain: NXDOMAIN.
+      const base = await ask("invalid", 1)
+      expect(base.rcode).toBe(3)
+      // An unrelated name: NXDOMAIN.
+      const other = await ask("evil.org", 1)
+      expect(other.rcode).toBe(3)
+    } finally {
+      child.kill()
+      agent.kill()
+      await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+})
+
+describe("upstream-resolver", () => {
+  test("answers only wildcard-matched names, refusing the rest", async () => {
+    if (!fs.existsSync("/usr/bin/python3") || !(await unixSocketsAvailable())) return
+    const dir = path.join(TEST_TMP, "upstream-test")
+    await fsPromises.mkdir(dir, { recursive: true })
+    await fsPromises.writeFile(path.join(dir, "wildcards.txt"), "*.invalid\n")
+    const script = path.join(import.meta.dirname, "..", "src", "fence", "upstream-resolver.py")
+    const child = Bun.spawn(["/usr/bin/python3", script, dir], { stderr: "pipe" })
+    try {
+      // Wait for the readiness line the fence wrapper also waits for.
+      const { value } = await child.stderr.getReader().read()
+      expect(new TextDecoder().decode(value)).toStartWith("upstream listening")
+      const client = [
+        "import socket, sys",
+        "c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+        "c.connect(sys.argv[1])",
+        "c.sendall((sys.argv[2] + ' ' + sys.argv[3] + '\\n').encode())",
+        "print(c.makefile('rb').readline().decode().strip())",
+        "c.close()",
+      ].join("\n")
+      const ask = async (name: string, qtype: string) => {
+        const p = Bun.spawn(
+          ["/usr/bin/python3", "-c", client, path.join(dir, "upstream.sock"), name, qtype],
+          { stdout: "pipe", stderr: "ignore" },
+        )
+        let out = ""
+        const reader = p.stdout.getReader()
+        for (;;) {
+          const { value, done } = await reader.read()
+          if (done) break
+          out += new TextDecoder().decode(value)
+        }
+        await p.exited
+        return out.trim()
+      }
+      // Matches the wildcard base: hermetically NXDOMAIN (.invalid, RFC 2606).
+      expect(await ask("unit-test.invalid", "1")).toBe("3\t")
+      // Not a strict subdomain / not a wildcard at all: refused, never answered.
+      expect(await ask("example.com", "1")).toBe("2\t")
+      expect(await ask("invalid", "1")).toBe("2\t")
+    } finally {
+      child.kill()
+      await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
     }
   })
 })
@@ -514,5 +804,15 @@ describe("fence-assets invariants", () => {
     expect(NAMESPACE_SETUP_SH).toContain('ip addr add "$DNS_IP"/30 dev "$IF"')
     expect(MOUNT_RUNNER_SH).toContain('mount --bind "$DIR/resolv.conf"')
     expect(MOUNT_RUNNER_SH).toContain('exec /bin/sh "$DIR/wrapped.sh"')
+  })
+
+  test("the wildcard agent is gated on wildcards.txt and cleaned up", () => {
+    // The agent (in-netns rule writer) starts only with wildcard entries and
+    // is killed by both the fail and the normal-exit paths.
+    expect(GUEST_SH).toContain('[ -s "$DIR/wildcards.txt" ]')
+    expect(GUEST_SH).toContain('$DIR/fence-agent.py" "$DIR"')
+    expect(GUEST_SH).toContain("AGENT_PID=$!")
+    // kill "$AGENT_PID" appears in fail() and in the final cleanup.
+    expect(GUEST_SH.match(/kill "\$AGENT_PID" 2>\/dev\/null/g)?.length).toBe(2)
   })
 })

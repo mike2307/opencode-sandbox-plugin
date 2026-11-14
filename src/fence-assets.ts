@@ -4,12 +4,22 @@
 //
 // Model (proxy-less, unprivileged, no host CAPs):
 //
-//   pasta --config-net -4         owns the network namespace (guest is uid 0 in
-//   (no port forwarding,          the pasta user namespace => local
-//    no gateway->host mapping)    CAP_NET_ADMIN, free :53 bind, veth, nft).
-//   + /usr/bin/bash guest.sh      pasta runs it as PID 1 of a fresh PID
-//                                 namespace: when it exits or is killed, the
-//                                 kernel kills the responder with it.
+//   pasta --config-net --ipv4-only  owns the network namespace (guest is uid 0
+//   (no port forwarding,             in the pasta user namespace => local
+//    no gateway->host mapping)        CAP_NET_ADMIN, free :53 bind, veth, nft).
+//   + upstream-resolver.py (host)    with wildcard entries: a host-side
+//   + /usr/bin/bash guest.sh         resolver (host netns, unix socket in
+//                                    DIR) that answers wildcard lookups via
+//                                    the host's DNS — started by the fence
+//                                    wrapper before pasta, killed after.
+//                                    pasta runs guest.sh as PID 1 of a fresh
+//                                    PID namespace: when it exits or is
+//                                    killed, the kernel kills the responder
+//                                    with it.
+//     + fence-agent.py (in-netns)    with wildcard entries: forwards the
+//                                    responder's lookups to the upstream
+//                                    resolver and adds an egress accept rule
+//                                    per vouched address.
 //     + setup.sh  (unshare --net) pinning DNS responder in its OWN netns at
 //                                 10.9.9.2, reached over a veth from the guest
 //                                 (pasta bridges a wildcard 0.0.0.0:53 into the
@@ -46,9 +56,11 @@ set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 RESP_PID=""
+AGENT_PID=""
 fail() {
   echo "opencode-sandbox fence: $1" >&2
   kill "$RESP_PID" 2>/dev/null
+  kill "$AGENT_PID" 2>/dev/null
   ip link del dns0 2>/dev/null
   rm -rf "$DIR"
   exit 1
@@ -59,6 +71,14 @@ fail() {
 ip link add dns0 type veth peer name dns1 || fail "creating the dns veth pair"
 ip addr add 10.9.9.1/30 dev dns0 || fail "addressing the dns veth pair"
 ip link set dns0 up || fail "bringing up the dns veth pair"
+
+# 1b. wildcard agent: when the allowlist carries wildcard entries, the
+#     in-netns agent turns upstream-vouched wildcard answers into egress
+#     rules (it must exist before the command may issue such a lookup).
+if [ -s "$DIR/wildcards.txt" ]; then
+  /usr/bin/python3 "$DIR/fence-agent.py" "$DIR" >"$DIR/agent.log" 2>&1 &
+  AGENT_PID=$!
+fi
 
 # 2. pinning responder in its OWN fresh netns (clean :53), in the background.
 unshare --net /usr/bin/bash "$DIR/setup.sh" "$DIR/egress-responder.py" "$DIR/pin.txt" >"$DIR/resp.log" 2>&1 &
@@ -106,6 +126,7 @@ rc=$?
 
 # 5. best-effort cleanup; the plugin also sweeps stale dirs at startup.
 kill "$RESP_PID" 2>/dev/null
+kill "$AGENT_PID" 2>/dev/null
 ip link del dns0 2>/dev/null
 rm -rf "$DIR"
 exit "$rc"
