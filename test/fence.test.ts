@@ -669,8 +669,8 @@ describe("egress-responder", () => {
     const dir = path.join(TEST_TMP, "resp-wc")
     await fsPromises.mkdir(dir, { recursive: true })
     await fsPromises.writeFile(path.join(dir, "pin.txt"), "")
-    await fsPromises.writeFile(path.join(dir, "wildcards.txt"), "*.invalid\n")
-    await fsPromises.writeFile(path.join(dir, "denied.txt"), "blocked.invalid\n")
+    await fsPromises.writeFile(path.join(dir, "wildcards.txt"), "*.example.invalid\n")
+    await fsPromises.writeFile(path.join(dir, "denied.txt"), "blocked.example.invalid\n")
     // Fake agent: answers every request with one fixed address.
     const fakeAgent = [
       "import socket, sys, os",
@@ -719,18 +719,18 @@ describe("egress-responder", () => {
         return { rcode: reply[3] & 0xf, answers: reply.readUInt16BE(6), tail: reply.subarray(-4) }
       }
       // A strict subdomain of the wildcard base is answered (by the agent).
-      const vouched = await ask("unit-test.invalid", 1)
+      const vouched = await ask("unit-test.example.invalid", 1)
       expect(vouched.rcode).toBe(0)
       expect(vouched.answers).toBe(1)
       expect([...vouched.tail]).toEqual([93, 184, 215, 16])
       // The base itself is not a subdomain: NXDOMAIN.
-      const base = await ask("invalid", 1)
+      const base = await ask("example.invalid", 1)
       expect(base.rcode).toBe(3)
       // An unrelated name: NXDOMAIN.
       const other = await ask("evil.org", 1)
       expect(other.rcode).toBe(3)
       // A denied subdomain: NXDOMAIN although the agent would vouch for it.
-      const denied = await ask("blocked.invalid", 1)
+      const denied = await ask("blocked.example.invalid", 1)
       expect(denied.rcode).toBe(3)
       expect(denied.answers).toBe(0)
     } finally {
@@ -746,8 +746,11 @@ describe("upstream-resolver", () => {
     if (!fs.existsSync("/usr/bin/python3") || !(await unixSocketsAvailable())) return
     const dir = path.join(TEST_TMP, "upstream-test")
     await fsPromises.mkdir(dir, { recursive: true })
-    await fsPromises.writeFile(path.join(dir, "wildcards.txt"), "*.invalid\n")
-    await fsPromises.writeFile(path.join(dir, "denied.txt"), "blocked.invalid\n*.deep.invalid\n")
+    await fsPromises.writeFile(path.join(dir, "wildcards.txt"), "*.example.invalid\n")
+    await fsPromises.writeFile(
+      path.join(dir, "denied.txt"),
+      "blocked.example.invalid\n*.deep.example.invalid\n",
+    )
     const script = path.join(import.meta.dirname, "..", "src", "fence", "upstream-resolver.py")
     const child = Bun.spawn(["/usr/bin/python3", script, dir], { stderr: "pipe" })
     try {
@@ -778,16 +781,16 @@ describe("upstream-resolver", () => {
         return out.trim()
       }
       // Matches the wildcard base: hermetically NXDOMAIN (.invalid, RFC 2606).
-      expect(await ask("unit-test.invalid", "1")).toBe("3\t")
+      expect(await ask("unit-test.example.invalid", "1")).toBe("3\t")
       // Not a strict subdomain / not a wildcard at all: refused, never answered.
       expect(await ask("example.com", "1")).toBe("2\t")
-      expect(await ask("invalid", "1")).toBe("2\t")
+      expect(await ask("example.invalid", "1")).toBe("2\t")
       // IPv4-only fence: AAAA is answered empty, never with v6 addresses.
-      expect(await ask("unit-test.invalid", "28")).toBe("0\t")
+      expect(await ask("unit-test.example.invalid", "28")).toBe("0\t")
       // Denied names (exact or by suffix) are NXDOMAIN before any lookup —
       // visible on AAAA, which an allowed name answers with "0".
-      expect(await ask("blocked.invalid", "28")).toBe("3\t")
-      expect(await ask("x.deep.invalid", "28")).toBe("3\t")
+      expect(await ask("blocked.example.invalid", "28")).toBe("3\t")
+      expect(await ask("x.deep.example.invalid", "28")).toBe("3\t")
     } finally {
       child.kill()
       await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
