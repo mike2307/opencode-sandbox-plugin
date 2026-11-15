@@ -99,12 +99,13 @@ def main() -> int:
                 qtype = parts[1].decode("ascii", "replace") if len(parts) > 1 else ""
                 rcode, ips = query_upstream(upstream, name, qtype)
                 if rcode == 0:
+                    # IPv4 only, like the fence itself (upstream sends no v6).
+                    ips = [ip for ip in ips if ":" not in ip]
                     for ip in ips:
                         if ip in added:
                             continue
-                        stmt = "ip" if ":" not in ip else "ip6"
                         proc = subprocess.run(
-                            ["nft", "add", "rule", *CHAIN, f"{stmt} daddr", ip, "accept"],
+                            ["nft", "add", "rule", *CHAIN, "ip daddr", ip, "accept"],
                             capture_output=True,
                         )
                         if proc.returncode != 0:

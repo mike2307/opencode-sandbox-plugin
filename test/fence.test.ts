@@ -16,6 +16,7 @@ import {
   parseFenceDenylist,
   parseFenceEntry,
   type Resolve4,
+  releaseFenceDir,
   runsWithNoNewPrivs,
   sweepFenceDirs,
 } from "../src/fence"
@@ -369,15 +370,43 @@ describe("buildFenceCommand", () => {
   })
 
   test("deniedDomains ['*'] unpins every domain but keeps raw IP entries", async () => {
-    const { dir } = await buildFenceCommand(
+    const { command, dir } = await buildFenceCommand(
       "/usr/bin/bwrap -- true",
-      ["registry.npmjs.org", "10.0.0.0/8"],
+      ["registry.npmjs.org", "*.github.com", "10.0.0.0/8"],
       { denylist: ["*"], resolve4: fakeResolve4, warn: () => {} },
     )
     try {
       expect(await fsPromises.readFile(path.join(dir, "pin.txt"), "utf8")).toBe("")
+      // `*` denies names, wildcards included: no wildcard base, no daemon.
+      expect(await fsPromises.readFile(path.join(dir, "wildcards.txt"), "utf8")).toBe("")
+      expect(command).not.toContain("upstream-resolver.py")
+      expect(await fsPromises.readFile(path.join(dir, "denied.txt"), "utf8")).toBe("*\n")
       expect(await fsPromises.readFile(path.join(dir, "nft.rules"), "utf8")).toContain(
         "add rule inet egress output ip daddr 10.0.0.0/8 accept",
+      )
+    } finally {
+      await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test("hands name denials to the runtime wildcard lookups (denied.txt)", async () => {
+    const { dir } = await buildFenceCommand(
+      "/usr/bin/bwrap -- true",
+      ["*.github.com", "*.evil.org"],
+      {
+        denylist: ["Evil.GitHub.com", "*.internal.github.com", "*.evil.org", "10.1.2.3"],
+        resolve4: fakeResolve4,
+        warn: () => {},
+      },
+    )
+    try {
+      // A wildcard covered by a denied wildcard is dropped up front...
+      expect(await fsPromises.readFile(path.join(dir, "wildcards.txt"), "utf8")).toBe(
+        "*.github.com\n",
+      )
+      // ...and names under a surviving wildcard are refused at lookup time.
+      expect(await fsPromises.readFile(path.join(dir, "denied.txt"), "utf8")).toBe(
+        "evil.github.com\n*.internal.github.com\n*.evil.org\n",
       )
     } finally {
       await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
@@ -641,6 +670,7 @@ describe("egress-responder", () => {
     await fsPromises.mkdir(dir, { recursive: true })
     await fsPromises.writeFile(path.join(dir, "pin.txt"), "")
     await fsPromises.writeFile(path.join(dir, "wildcards.txt"), "*.invalid\n")
+    await fsPromises.writeFile(path.join(dir, "denied.txt"), "blocked.invalid\n")
     // Fake agent: answers every request with one fixed address.
     const fakeAgent = [
       "import socket, sys, os",
@@ -699,6 +729,10 @@ describe("egress-responder", () => {
       // An unrelated name: NXDOMAIN.
       const other = await ask("evil.org", 1)
       expect(other.rcode).toBe(3)
+      // A denied subdomain: NXDOMAIN although the agent would vouch for it.
+      const denied = await ask("blocked.invalid", 1)
+      expect(denied.rcode).toBe(3)
+      expect(denied.answers).toBe(0)
     } finally {
       child.kill()
       agent.kill()
@@ -713,6 +747,7 @@ describe("upstream-resolver", () => {
     const dir = path.join(TEST_TMP, "upstream-test")
     await fsPromises.mkdir(dir, { recursive: true })
     await fsPromises.writeFile(path.join(dir, "wildcards.txt"), "*.invalid\n")
+    await fsPromises.writeFile(path.join(dir, "denied.txt"), "blocked.invalid\n*.deep.invalid\n")
     const script = path.join(import.meta.dirname, "..", "src", "fence", "upstream-resolver.py")
     const child = Bun.spawn(["/usr/bin/python3", script, dir], { stderr: "pipe" })
     try {
@@ -747,6 +782,12 @@ describe("upstream-resolver", () => {
       // Not a strict subdomain / not a wildcard at all: refused, never answered.
       expect(await ask("example.com", "1")).toBe("2\t")
       expect(await ask("invalid", "1")).toBe("2\t")
+      // IPv4-only fence: AAAA is answered empty, never with v6 addresses.
+      expect(await ask("unit-test.invalid", "28")).toBe("0\t")
+      // Denied names (exact or by suffix) are NXDOMAIN before any lookup —
+      // visible on AAAA, which an allowed name answers with "0".
+      expect(await ask("blocked.invalid", "28")).toBe("3\t")
+      expect(await ask("x.deep.invalid", "28")).toBe("3\t")
     } finally {
       child.kill()
       await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => {})
@@ -814,5 +855,42 @@ describe("fence-assets invariants", () => {
     expect(GUEST_SH).toContain("AGENT_PID=$!")
     // kill "$AGENT_PID" appears in fail() and in the final cleanup.
     expect(GUEST_SH.match(/kill "\$AGENT_PID" 2>\/dev\/null/g)?.length).toBe(2)
+    // Its readiness is awaited (a lookup before it listens would fail), and
+    // an agent that never comes up is fatal.
+    expect(GUEST_SH).toContain('grep -q "^agent listening"')
+    expect(GUEST_SH).toContain('fail "wildcard agent failed"')
+    expect(GUEST_SH.indexOf('grep -q "^agent listening"')).toBeLessThan(
+      GUEST_SH.indexOf("unshare --mount"),
+    )
+  })
+})
+
+describe("releaseFenceDir", () => {
+  const sleeper = (...extra: string[]) =>
+    Bun.spawn(["/usr/bin/python3", "-c", "import time; time.sleep(30)", ...extra])
+
+  test("terminates this dir's resolver, never an unrelated process", async () => {
+    if (!fs.existsSync("/usr/bin/python3") || !fs.existsSync("/proc/self/cmdline")) return
+    const dir = path.join(TEST_TMP, `${FENCE_DIR_PREFIX}release`)
+    const other = path.join(TEST_TMP, `${FENCE_DIR_PREFIX}release-other`)
+    for (const d of [dir, other]) await fsPromises.mkdir(d, { recursive: true })
+    // Stand-ins: one carries this dir's resolver path in its argv, the other
+    // is an unrelated process that reused the recorded pid.
+    const resolver = sleeper(path.join(dir, "upstream-resolver.py"))
+    const unrelated = sleeper()
+    try {
+      await fsPromises.writeFile(path.join(other, "upstream.pid"), `${unrelated.pid}\n`)
+      await releaseFenceDir(other)
+      expect(fs.existsSync(other)).toBe(false)
+      expect(unrelated.killed || unrelated.exitCode !== null).toBe(false)
+
+      await fsPromises.writeFile(path.join(dir, "upstream.pid"), `${resolver.pid}\n`)
+      await releaseFenceDir(dir)
+      expect(fs.existsSync(dir)).toBe(false)
+      expect(await resolver.exited).not.toBe(0)
+    } finally {
+      resolver.kill()
+      unrelated.kill()
+    }
   })
 })

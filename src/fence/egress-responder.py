@@ -14,8 +14,8 @@ NXDOMAINs everything else. No privilege drop, no upstream, no daemon.
 
 Only A (1) and AAAA (28) queries are answered. Pinned names are answered from
 the pin file. Non-pinned names that are strict subdomains of a wildcard base
-(<dir>/wildcards.txt, next to the pin file) are vouched on demand through the
-fence agent (unix socket <dir>/agent.sock) — which asks the host-side upstream
+(<dir>/wildcards.txt, next to the pin file) and not denied (<dir>/denied.txt)
+are vouched on demand through the fence agent (unix socket <dir>/agent.sock) — which asks the host-side upstream
 resolver and opens the egress ruleset for the answered addresses — anything
 else is NXDOMAIN. Single-question queries only (which is what resolvers send).
 """
@@ -86,6 +86,32 @@ def matches_wildcard(name, bases):
     return any(name.endswith("." + b) and name.count(".") > b.count(".") for b in bases)
 
 
+def load_denied(pinfile):
+    """deniedDomains from <dir>/denied.txt (next to the pin file): `*` denies
+    every name, `*.domain` strict subdomains, anything else an exact name.
+    Returns (deny_all, names, suffixes)."""
+    base_dir = os.path.dirname(os.path.abspath(pinfile))
+    deny_all, names, suffixes = False, set(), []
+    try:
+        with open(os.path.join(base_dir, "denied.txt")) as f:
+            for line in f:
+                line = line.strip().lower()
+                if line == "*":
+                    deny_all = True
+                elif line.startswith("*."):
+                    suffixes.append(line[1:])
+                elif line:
+                    names.add(line)
+    except OSError:
+        pass
+    return deny_all, names, suffixes
+
+
+def is_denied(name, denied):
+    deny_all, names, suffixes = denied
+    return deny_all or name in names or any(name.endswith(s) for s in suffixes)
+
+
 def query_agent(sock_path, name, qtype):
     """One vouch request to the in-netns agent. (2, []) when it is not there."""
     try:
@@ -124,6 +150,7 @@ def main() -> int:
             pins.setdefault(parts[0].lower(), []).extend(parts[1:])
 
     bases = load_wildcard_bases(pinfile)
+    denied = load_denied(pinfile)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind((addr, port))
@@ -150,8 +177,14 @@ def main() -> int:
             # is vouched on demand through the agent (upstream resolver +
             # egress rule); everything else is NXDOMAIN. (A 0.0.0.0 sinkhole
             # would point at the local host, and "unknown host" is the
-            # clearer failure.)
-            if agent_sock and bases and matches_wildcard(qname, bases):
+            # clearer failure.) Denials take precedence over wildcards; the
+            # upstream resolver enforces them again.
+            if (
+                agent_sock
+                and bases
+                and matches_wildcard(qname, bases)
+                and not is_denied(qname, denied)
+            ):
                 rcode, ips = query_agent(agent_sock, qname, qtype)
             else:
                 rcode = 3

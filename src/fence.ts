@@ -67,13 +67,13 @@ export function parseFenceEntry(raw: string): FenceEntry {
     // `*.domain` is the only wildcard form: subdomains are resolved on
     // demand. Over-broad bases (a single label, as in `*.com`) are refused
     // exactly like the runtime schema refuses them.
-    const wildcard = entry.match(/^\*\.(.+)$/)
-    if (wildcard && wildcard[1].includes(".") && DOMAIN_RE.test(wildcard[1]))
-      return { kind: "wildcard", base: wildcard[1].toLowerCase() }
+    const base = entry.match(/^\*\.(.+)$/)?.[1]
+    if (base?.includes(".") && DOMAIN_RE.test(base))
+      return { kind: "wildcard", base: base.toLowerCase() }
     return {
       kind: "skip",
       entry,
-      reason: wildcard
+      reason: base
         ? "overly broad wildcard (the base needs at least two labels)"
         : "wildcard domains must be of the form *.domain",
     }
@@ -278,7 +278,10 @@ export async function buildFenceCommand(
     warn(`[opencode-sandbox] fence: ignoring denylist entry ${skip.entry} — ${skip.reason}`)
   const parsed = await parseFenceAllowlist(
     allowlist.filter((entry) => {
-      if (denied.allNames && parseFenceEntry(entry).kind === "domain") return false
+      // `*` denies every NAME: exact domains and wildcards alike; raw
+      // IP/CIDR entries stay (the proxy model matches names, not IPs).
+      const kind = parseFenceEntry(entry).kind
+      if (denied.allNames && (kind === "domain" || kind === "wildcard")) return false
       return !isDeniedName(entry, denied)
     }),
     options.resolve4,
@@ -305,6 +308,9 @@ export async function buildFenceCommand(
       fsPromises.writeFile(path.join(dir, "nsswitch.conf"), NSSWITCH_CONF),
       fsPromises.writeFile(path.join(dir, "pin.txt"), pinLines(parsed.pins)),
       fsPromises.writeFile(path.join(dir, "wildcards.txt"), wildcardLines(parsed.wildcards)),
+      // Wildcard lookups happen at runtime, so the denials must travel with
+      // them: the responder and the upstream resolver both refuse these.
+      fsPromises.writeFile(path.join(dir, "denied.txt"), deniedLines(denied)),
       fsPromises.writeFile(path.join(dir, "nft.rules"), nftRules(parsed, denied.networks)),
       // The wrapped command is already a fully quoted command line
       // (the runtime quotes every word with POSIX single quotes); as the body
@@ -443,6 +449,17 @@ function wildcardLines(wildcards: string[]): string {
   return `${wildcards.map((base) => `*.${base}`).join("\n")}\n`
 }
 
+/** Denied names for the runtime (wildcard) lookups: exact names, `*.domain`
+ * suffixes, and `*` for deny-all; empty when nothing is denied by name. */
+function deniedLines(denied: FenceDenied): string {
+  const lines = [
+    ...(denied.allNames ? ["*"] : []),
+    ...denied.names,
+    ...denied.suffixes.map((suffix) => `*${suffix}`),
+  ]
+  return lines.length === 0 ? "" : `${lines.join("\n")}\n`
+}
+
 function nftRules(parsed: FenceParsed, deniedNetworks: string[] = []): string {
   // inet: one policy-drop chain for BOTH families, so IPv6 egress is dropped
   // (only loopback passes) even if pasta ever configured v6.
@@ -508,7 +525,13 @@ export async function releaseFenceDir(dir: string): Promise<void> {
   try {
     const raw = await fsPromises.readFile(path.join(dir, "upstream.pid"), "utf8")
     const pid = Number(raw.trim())
-    if (Number.isInteger(pid) && pid > 0) process.kill(pid, "SIGTERM")
+    // Only signal the pid if it still IS this dir's resolver: after a killed
+    // command the daemon may be gone and its pid reused by another process.
+    if (Number.isInteger(pid) && pid > 0) {
+      const cmdline = await fsPromises.readFile(`/proc/${pid}/cmdline`, "utf8")
+      if (cmdline.split("\0").includes(path.join(dir, "upstream-resolver.py")))
+        process.kill(pid, "SIGTERM")
+    }
   } catch {
     // no daemon (no wildcards) or already gone
   }

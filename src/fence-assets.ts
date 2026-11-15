@@ -78,6 +78,21 @@ ip link set dns0 up || fail "bringing up the dns veth pair"
 if [ -s "$DIR/wildcards.txt" ]; then
   /usr/bin/python3 "$DIR/fence-agent.py" "$DIR" >"$DIR/agent.log" 2>&1 &
   AGENT_PID=$!
+  # Wait for its readiness line: a lookup before the agent listens would fail.
+  AGENT_READY=""
+  for i in $(seq 1 250); do
+    if grep -q "^agent listening" "$DIR/agent.log" 2>/dev/null; then
+      AGENT_READY=1
+      break
+    fi
+    kill -0 "$AGENT_PID" 2>/dev/null || break
+    sleep 0.02
+  done
+  if [ -z "$AGENT_READY" ]; then
+    echo "opencode-sandbox fence: the wildcard agent did not come up:" >&2
+    cat "$DIR/agent.log" >&2
+    fail "wildcard agent failed"
+  fi
 fi
 
 # 2. pinning responder in its OWN fresh netns (clean :53), in the background.

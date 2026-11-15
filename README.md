@@ -177,7 +177,7 @@ v1 allowlist entry support (entries come from `allowedDomains`, same as the prox
 - IPv4 literals and CIDRs (e.g. `10.17.146.234`, `10.16.59.0/24`)
 - *not supported yet*: `:port` suffixes, IPv6 — such entries are skipped with a warning
 
-`deniedDomains` narrows the allowlist: denied exact domains and `*.domain` wildcards are never pinned, denied IPv4 literals/CIDRs are dropped ahead of every allow rule (e.g. inside an allowed CIDR), and `*` (deny-all) leaves no domain entry pinned while raw IP/CIDR entries stay effective — the same as the proxy model, where `*` matches names, not IP destinations.
+`deniedDomains` narrows the allowlist and takes precedence over it: denied exact domains and `*.domain` wildcards are never pinned, and names under an allowed wildcard that match a denial get NXDOMAIN at lookup time (e.g. `*.github.com` allowed, `evil.github.com` denied); denied IPv4 literals/CIDRs are dropped ahead of every allow rule (e.g. inside an allowed CIDR); and `*` (deny-all) disables every domain and wildcard entry while raw IP/CIDR entries stay effective — the same as the proxy model, where `*` matches names, not IP destinations. Wildcard subdomains are IPv4-only like the rest of the fence (AAAA lookups are answered empty).
 
 Limitations: DNS is answered over UDP only; pinned addresses — and the addresses vouched for wildcard subdomains — are fixed for the command's lifetime, so a very long-running command does not follow DNS changes.
 
