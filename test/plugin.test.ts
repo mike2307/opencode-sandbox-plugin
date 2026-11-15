@@ -4,6 +4,15 @@ import fsPromises from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
+// mock.module is process-wide and live (it mutates the export bindings of
+// already-imported modules, and in a shared, non-isolated `bun test` run it
+// persists across test files). Snapshot the real modules eagerly — before any
+// mock is installed — and restore them in afterAll below, so later test files
+// that import src/fence.ts / src/probe.ts directly (test/fence.test.ts,
+// test/probe.test.ts) still get the real modules regardless of file order.
+const realFenceModule = { ...(await import("../src/fence")) }
+const realProbeModule = { ...(await import("../src/probe")) }
+
 // Mock the SandboxManager before importing the plugin
 const mockInitialize = mock(() => Promise.resolve())
 const mockWrapWithSandbox = mock((cmd: string) => Promise.resolve(`srt-wrapped: ${cmd}`))
@@ -51,6 +60,16 @@ mock.module("../src/fence", () => ({
 mock.module("@opencode/plugin", () => ({
   Plugin: { define: (plugin: unknown) => plugin },
 }))
+
+// Return the real modules to the registry: the partial mocks above only cover
+// this file's plugin-wiring assertions. Without this restore, a later test
+// file in the same process (test/fence.test.ts, test/probe.test.ts) would
+// resolve its static imports against the partial mocks and fail on the
+// missing exports.
+afterAll(() => {
+  mock.module("../src/fence", () => realFenceModule)
+  mock.module("../src/probe", () => realProbeModule)
+})
 
 const pluginModule = await import("../src/index")
 // Root index.ts is what OpenCode 2 loads for local path plugins; it must stay
