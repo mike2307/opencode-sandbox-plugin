@@ -762,7 +762,7 @@ describe("upstream-resolver", () => {
         "c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
         "c.connect(sys.argv[1])",
         "c.sendall((sys.argv[2] + ' ' + sys.argv[3] + '\\n').encode())",
-        "print(c.makefile('rb').readline().decode().strip())",
+        "sys.stdout.write(c.makefile('rb').readline().decode().rstrip('\\n'))",
         "c.close()",
       ].join("\n")
       const ask = async (name: string, qtype: string) => {
@@ -778,7 +778,9 @@ describe("upstream-resolver", () => {
           out += new TextDecoder().decode(value)
         }
         await p.exited
-        return out.trim()
+        // The helper strips only the line feed, so out is the raw protocol
+        // line (<rcode>\t<ips>); the tab is meaningful and must survive.
+        return out
       }
       // Matches the wildcard base: hermetically NXDOMAIN (.invalid, RFC 2606).
       expect(await ask("unit-test.example.invalid", "1")).toBe("3\t")
