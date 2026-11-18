@@ -39,18 +39,20 @@ Verify with `opencode plugin list`.
 
 ### Linux prerequisites
 
-**1. Install bubblewrap:**
+**1. Install bubblewrap and socat:**
 
 ```bash
 # Debian/Ubuntu
-sudo apt install bubblewrap
+sudo apt install bubblewrap socat
 
 # Fedora
-sudo dnf install bubblewrap
+sudo dnf install bubblewrap socat
 
 # Arch
-sudo pacman -S bubblewrap
+sudo pacman -S bubblewrap socat
 ```
+
+Both are required on every Linux machine, in every sandbox mode: `@anthropic-ai/sandbox-runtime` checks `socat` at initialization (it operates the proxy-based network sandbox's network bridge) and blocks all commands with `Sandbox dependencies not available: socat not installed` when it is missing — even when you only use the network fence, which does not use socat itself.
 
 **2. Ubuntu 24.04+ (AppArmor fix):**
 
@@ -75,7 +77,7 @@ bwrap --ro-bind / / --dev /dev --proc /proc -- echo "sandbox works"
 
 Without this fix, bwrap will fail with `loopback: Failed RTM_NEWADDR: Operation not permitted` or `setting up uid map: Permission denied`.
 
-**3. (Only for the network fence)** If you use `network.fenced: true`, the fence needs a few more tools on the host, in addition to bubblewrap:
+**3. (Only for the network fence)** If you use `network.fenced: true`, the fence needs a few more tools on the host, in addition to bubblewrap and socat:
 
 ```bash
 # Debian/Ubuntu
