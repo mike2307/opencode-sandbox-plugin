@@ -467,9 +467,13 @@ Close every mutation path with permission rules in `opencode.json`. For paths ou
     // no agent workflow ever writes there
     { "action": "edit", "resource": "~/.cache/opencode-sandbox/*", "effect": "deny" },
     { "action": "edit", "resource": "~/.config/opencode-sandbox/*", "effect": "deny" },
-    // require a decision before built-in mutation tools touch OpenCode's own
-    // configuration (opencode.json, sandbox.json, per-project configs)
-    { "action": "edit", "resource": "~/.config/opencode/*", "effect": "ask" }
+    // OpenCode's own configuration (opencode.json, sandbox.json, per-project
+    // configs): the agent must not modify it at all — except creating
+    // skills, each confirmed by a prompt. The ask follows the deny so it
+    // wins (last matching rule wins); a hard deny on the tree itself keeps
+    // it out of reach of saved approvals
+    { "action": "edit", "resource": "~/.config/opencode/*", "effect": "deny" },
+    { "action": "edit", "resource": "~/.config/opencode/skills/*", "effect": "ask" }
   ]
 }
 ```
@@ -477,7 +481,7 @@ Close every mutation path with permission rules in `opencode.json`. For paths ou
 Notes:
 
 - The gate denies cover every tool that touches external paths — `read`, `write`, `edit`, `patch`, and shell commands whose directories the scanner infers; the `edit` action alone covers only the three mutation tools.
-- A configured `deny` is always enforced and cannot be overridden by saved approvals ("Allow always"). The `ask` rule *can* be weakened by choosing "Allow always" on one of its prompts — review saved approvals from time to time.
+- A configured `deny` is always enforced and cannot be overridden by saved approvals ("Allow always") — which is why the config tree is a hard deny rather than an ask. The skills `ask` *can* be weakened by choosing "Allow always" on one of its prompts — review saved approvals from time to time.
 - `~` is expanded when the config loads; if you set `XDG_CONFIG_HOME`/`XDG_CACHE_HOME`, add matching rules for those base paths instead.
 - The read-side gap (vector 1) is closed with `read` denies for your sensitive paths, e.g. `{ "action": "read", "resource": "~/.ssh/*", "effect": "deny" }`.
 
