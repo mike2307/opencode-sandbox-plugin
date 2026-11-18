@@ -247,7 +247,7 @@ Initialization succeeding says nothing about the OS sandbox actually enforcing a
 
 ## Configuration
 
-Config files are stored outside the project directory (in `~/.config/opencode/` or `~/.config/opencode-sandbox/`) so that sandboxed commands cannot modify them. This prevents indirect prompt injection from weakening the sandbox by overwriting the config.
+Config files are stored outside the project directory (in `~/.config/opencode/` or `~/.config/opencode-sandbox/`) so that sandboxed commands cannot modify them. This prevents indirect prompt injection from weakening the sandbox by overwriting the config. That only stops *sandboxed* commands, though: OpenCode's built-in file tools run in the server process, outside the sandbox — see [Security hardening](#security-hardening) for the permission rules that close that gap.
 
 ### Invalid config fails closed
 
@@ -439,6 +439,47 @@ git diff --no-index pristine/node_modules patched/node_modules > patches/@anthro
 ### Test isolation note
 
 `bun test` runs test files in one process by default, and `mock.module()` is process-global and never reset between files (oven-sh/bun#31316) — `test/plugin.test.ts` mocks `../src/probe`, which would break `test/probe.test.ts`'s imports in the same process. The `test` script therefore runs each test file in its own `bun test` invocation.
+
+## Security hardening
+
+The sandbox wraps **shell commands only**. OpenCode's built-in file tools (`read`, `write`, `edit`, `patch`) run in the OpenCode server process with the user's normal privileges — they never go through the shell hook, so their filesystem access is *not* sandboxed. An agent that steers those tools can break out of the sandbox's protection in three ways:
+
+1. **Reading protected files** — files that are hidden from sandboxed commands (e.g. `~/.ssh/id_rsa`) are still readable through the `read` tool.
+2. **Disabling the sandbox through state and config files** — all of them live outside the sandbox's writable area, but the server process has no such restriction:
+   - *Temporary pause*: the [toggle state](#toggle) under `~/.cache/opencode-sandbox/toggle/` — writing `{"disabled": true}` to `<hash>.json` (hash = first 16 hex chars of the SHA-256 of the resolved project directory) unsandboxes every subsequent command for that project; the state survives restarts and re-enables itself after 7 days.
+   - *Permanent per-project disable*: a per-project [config](#config-file-locations) with `"disabled": true` — `~/.config/opencode/projects/<project-name>.sandbox.json` (or the legacy `~/.config/opencode-sandbox/projects/<project-name>.json`). Unlike the toggle, it never re-enables on its own.
+   - *Global disable or plugin removal*: `~/.config/opencode/sandbox.json` (or the legacy `~/.config/opencode-sandbox/config.json`) disables the sandbox everywhere, and OpenCode's own `opencode.json`/`opencode.jsonc` can drop the plugin entry or the permission rules below.
+3. **Tampering with the sandbox shim** — each wrapped command is executed by a per-shell shim script under `~/.cache/opencode-sandbox/shim/` that the server spawns *outside* the sandbox; the plugin writes it once per shell and never verifies it again. Overwriting it (e.g. dropping the wrapper) runs every subsequent command unsandboxed, and the script itself runs as a server child process with your full host privileges.
+
+Close every mutation path with permission rules in `opencode.json`. For paths outside the project, `external_directory` is checked **before** the `read`/`edit` rules — so if you run a broad `external_directory` ask (common when locking down outside-project access), the gate would prompt *before* an `edit` deny ever gets to reject. The trees therefore need gate denies, with the `edit` denies kept as a second layer in case the gate rules are ever dropped:
+
+```jsonc
+{
+  "permissions": [
+    // directory gate: the plugin's cache tree (toggle state and shim scripts)
+    // and the legacy config locations are off-limits before any tool-level
+    // check even runs — no prompt, deny at the first check
+    { "action": "external_directory", "resource": "~/.cache/opencode-sandbox/*", "effect": "deny" },
+    { "action": "external_directory", "resource": "~/.config/opencode-sandbox/*", "effect": "deny" },
+    // tool level: the plugin's cache tree is rewritten by the plugin on
+    // demand, and the legacy config locations (global config, per-project
+    // configs with permanent disable flags) are still read by the plugin —
+    // no agent workflow ever writes there
+    { "action": "edit", "resource": "~/.cache/opencode-sandbox/*", "effect": "deny" },
+    { "action": "edit", "resource": "~/.config/opencode-sandbox/*", "effect": "deny" },
+    // require a decision before built-in mutation tools touch OpenCode's own
+    // configuration (opencode.json, sandbox.json, per-project configs)
+    { "action": "edit", "resource": "~/.config/opencode/*", "effect": "ask" }
+  ]
+}
+```
+
+Notes:
+
+- The gate denies cover every tool that touches external paths — `read`, `write`, `edit`, `patch`, and shell commands whose directories the scanner infers; the `edit` action alone covers only the three mutation tools.
+- A configured `deny` is always enforced and cannot be overridden by saved approvals ("Allow always"). The `ask` rule *can* be weakened by choosing "Allow always" on one of its prompts — review saved approvals from time to time.
+- `~` is expanded when the config loads; if you set `XDG_CONFIG_HOME`/`XDG_CACHE_HOME`, add matching rules for those base paths instead.
+- The read-side gap (vector 1) is closed with `read` denies for your sensitive paths, e.g. `{ "action": "read", "resource": "~/.ssh/*", "effect": "deny" }`.
 
 ## Related
 
